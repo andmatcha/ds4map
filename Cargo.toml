@@ -8,3 +8,4 @@ name = "ds4"
 path = "src/main.rs"
 
 [dependencies]
+hidapi = "2.6.3"
