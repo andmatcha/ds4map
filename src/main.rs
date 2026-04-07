@@ -2,6 +2,7 @@ mod arm9;
 mod cli;
 mod compact;
 mod ds4_hid;
+mod mode_sound;
 mod serial_out;
 
 use std::process::ExitCode;

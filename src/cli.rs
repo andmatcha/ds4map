@@ -1,6 +1,7 @@
 use crate::arm9::ManualPacketEncoder;
 use crate::compact;
 use crate::ds4_hid;
+use crate::mode_sound::ModeSoundPlayer;
 use crate::serial_out::{SerialConfig, SerialOutput};
 use std::env;
 use std::process::ExitCode;
@@ -96,18 +97,23 @@ fn run_manual_output(args: Vec<String>) -> ExitCode {
     };
 
     let mut encoder = ManualPacketEncoder::new();
+    let mut sound_player = ModeSoundPlayer::new();
 
     if config.monitor_only {
         return match ds4_hid::monitor_input_reports(|event| {
             match compact::convert_input_report(&event.report) {
                 Ok(compact_report) => {
-                    let manual_packet = encoder.encode_compact_report(&compact_report);
+                    let update = encoder.encode_compact_report_update(&compact_report);
+                    if update.profile_changed {
+                        sound_player.play(update.profile.as_str());
+                    }
                     println!(
-                        "[#{}] transport={} compact={} arm9={}",
+                        "[#{}] transport={} profile={} compact={} arm9={}",
                         event.sequence,
                         event.device.transport,
+                        update.profile.as_str(),
                         ds4_hid::format_report_hex(&compact_report),
-                        ds4_hid::format_report_hex(&manual_packet)
+                        ds4_hid::format_report_hex(&update.packet)
                     );
                 }
                 Err(error) => {
@@ -146,8 +152,11 @@ fn run_manual_output(args: Vec<String>) -> ExitCode {
     match ds4_hid::monitor_input_reports(|event| {
         match compact::convert_input_report(&event.report) {
             Ok(compact_report) => {
-                let manual_packet = encoder.encode_compact_report(&compact_report);
-                if let Err(error) = serial.write_bytes(&manual_packet) {
+                let update = encoder.encode_compact_report_update(&compact_report);
+                if update.profile_changed {
+                    sound_player.play(update.profile.as_str());
+                }
+                if let Err(error) = serial.write_bytes(&update.packet) {
                     eprintln!(
                         "[#{}] failed to write MANUAL packet to serial: {}",
                         event.sequence, error

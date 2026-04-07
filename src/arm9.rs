@@ -17,6 +17,13 @@ const DEFAULT_NEUTRAL_CURRENT: u16 = 255;
 
 pub type ManualPacket = [u8; MANUAL_PACKET_LEN];
 
+#[derive(Debug, Clone, Copy)]
+pub struct Arm9PacketUpdate {
+    pub packet: ManualPacket,
+    pub profile: ManualProfile,
+    pub profile_changed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualProfile {
     Normal,
@@ -72,11 +79,11 @@ impl ManualPacketEncoder {
         Self::default()
     }
 
-    pub fn encode_compact_report(&mut self, compact: &CompactReport) -> ManualPacket {
+    pub fn encode_compact_report_update(&mut self, compact: &CompactReport) -> Arm9PacketUpdate {
         let state = CompactState::new(compact);
 
         self.update_enable_toggle(state.options_pressed());
-        self.update_profile_toggle(state.share_pressed());
+        let profile_changed = self.update_profile_toggle(state.share_pressed());
 
         let control_byte = build_manual_control_byte(
             state.r3_pressed(),
@@ -144,7 +151,15 @@ impl ManualPacketEncoder {
 
         self.seq = self.seq.wrapping_add(1);
 
-        build_manual_packet(self.header, self.seq, self.enable, currents, control_byte)
+        Arm9PacketUpdate {
+            packet: build_manual_packet(self.header, self.seq, self.enable, currents, control_byte),
+            profile: self.profile,
+            profile_changed,
+        }
+    }
+
+    pub fn encode_compact_report(&mut self, compact: &CompactReport) -> ManualPacket {
+        self.encode_compact_report_update(compact).packet
     }
 
     #[cfg(test)]
@@ -159,15 +174,26 @@ impl ManualPacketEncoder {
         self.previous_options_pressed = options_pressed;
     }
 
-    fn update_profile_toggle(&mut self, share_pressed: bool) {
+    fn update_profile_toggle(&mut self, share_pressed: bool) -> bool {
+        let mut profile_changed = false;
         if share_pressed && !self.previous_share_pressed {
             self.profile = self.profile.next();
+            profile_changed = true;
         }
         self.previous_share_pressed = share_pressed;
+        profile_changed
     }
 }
 
 impl ManualProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Power => "power",
+            Self::Sensitive => "sensitive",
+        }
+    }
+
     fn next(self) -> Self {
         match self {
             Self::Normal => Self::Power,
