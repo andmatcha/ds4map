@@ -1,5 +1,6 @@
 use crate::compact;
 use crate::ds4_hid;
+use crate::serial_out::{SerialConfig, SerialOutput};
 use std::env;
 use std::process::ExitCode;
 
@@ -9,7 +10,7 @@ pub fn run() -> ExitCode {
 
     match args.next().as_deref() {
         Some("list") => list_devices(),
-        Some("run") => run_compact_output(),
+        Some("run") => run_compact_output(args.collect()),
         Some("monitor") => monitor_reports(),
         Some("stop") => {
             println!("stop command is not implemented yet");
@@ -27,15 +28,36 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_compact_output() -> ExitCode {
+fn run_compact_output(args: Vec<String>) -> ExitCode {
+    let config = match parse_run_args(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
+            eprintln!("Usage: ds4 run --port <PORT> --baud <BAUD_RATE>");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut serial = match SerialOutput::open(&config) {
+        Ok(serial) => serial,
+        Err(error) => {
+            eprintln!(
+                "failed to open serial port {} at {} baud: {}",
+                config.port, config.baud_rate, error
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     match ds4_hid::monitor_input_reports(|event| {
         match compact::convert_input_report(&event.report) {
             Ok(compact_report) => {
-                println!(
-                    "[#{}] compact={}",
-                    event.sequence,
-                    compact::format_compact_hex(&compact_report)
-                );
+                if let Err(error) = serial.write_report(&compact_report) {
+                    eprintln!(
+                        "[#{}] failed to write compact report to serial: {}",
+                        event.sequence, error
+                    );
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -54,6 +76,38 @@ fn run_compact_output() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn parse_run_args(args: Vec<String>) -> Result<SerialConfig, String> {
+    let mut port = None;
+    let mut baud_rate = None;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--port" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --port"))?;
+                port = Some(value);
+            }
+            "--baud" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --baud"))?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid baud rate: {value}"))?;
+                baud_rate = Some(parsed);
+            }
+            other => return Err(format!("unknown run option: {other}")),
+        }
+    }
+
+    Ok(SerialConfig {
+        port: port.ok_or_else(|| String::from("missing required option: --port"))?,
+        baud_rate: baud_rate.ok_or_else(|| String::from("missing required option: --baud"))?,
+    })
 }
 
 fn list_devices() -> ExitCode {
@@ -106,7 +160,7 @@ fn print_usage(bin_name: &str) {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  list    List connected DUALSHOCK 4 devices");
-    eprintln!("  run     Output DS4_COMPACT_V1 reports");
+    eprintln!("  run     Stream DS4_COMPACT_V1 reports to a serial port");
     eprintln!("  monitor Continuously monitor HID input reports from a DUALSHOCK 4");
     eprintln!("  stop    Stop the running action");
 }

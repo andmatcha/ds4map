@@ -32,14 +32,6 @@ pub fn convert_input_report(report: &[u8]) -> Result<CompactReport, CompactError
     convert_hid10(&hid10)
 }
 
-pub fn format_compact_hex(report: &CompactReport) -> String {
-    report
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn normalize_input_report(report: &[u8]) -> Result<[u8; NORMALIZED_LEN], CompactError> {
     if report.len() >= USB_REPORT_LEN {
         return Ok(report[..NORMALIZED_LEN]
