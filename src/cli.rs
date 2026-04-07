@@ -1,3 +1,4 @@
+use crate::compact;
 use crate::ds4_hid;
 use std::env;
 use std::process::ExitCode;
@@ -8,10 +9,7 @@ pub fn run() -> ExitCode {
 
     match args.next().as_deref() {
         Some("list") => list_devices(),
-        Some("run") => {
-            println!("run command is not implemented yet");
-            ExitCode::SUCCESS
-        }
+        Some("run") => run_compact_output(),
         Some("monitor") => monitor_reports(),
         Some("stop") => {
             println!("stop command is not implemented yet");
@@ -25,6 +23,35 @@ pub fn run() -> ExitCode {
         None => {
             print_usage(&bin_name);
             ExitCode::from(2)
+        }
+    }
+}
+
+fn run_compact_output() -> ExitCode {
+    match ds4_hid::monitor_input_reports(|event| {
+        match compact::convert_input_report(&event.report) {
+            Ok(compact_report) => {
+                println!(
+                    "[#{}] compact={}",
+                    event.sequence,
+                    compact::format_compact_hex(&compact_report)
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "[#{}] skipped unsupported report (transport={}, bytes={}): {}",
+                    event.sequence,
+                    event.device.transport,
+                    event.report.len(),
+                    error
+                );
+            }
+        }
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("failed to run compact output: {error}");
+            ExitCode::from(1)
         }
     }
 }
@@ -79,7 +106,7 @@ fn print_usage(bin_name: &str) {
     eprintln!();
     eprintln!("Commands:");
     eprintln!("  list    List connected DUALSHOCK 4 devices");
-    eprintln!("  run     Placeholder for future execution behavior");
+    eprintln!("  run     Output DS4_COMPACT_V1 reports");
     eprintln!("  monitor Continuously monitor HID input reports from a DUALSHOCK 4");
     eprintln!("  stop    Stop the running action");
 }

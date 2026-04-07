@@ -1,4 +1,5 @@
 mod cli;
+mod compact;
 mod ds4_hid;
 
 use std::process::ExitCode;
