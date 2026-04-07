@@ -42,8 +42,10 @@ impl SerialOutput {
     }
 
     pub fn write_report(&mut self, report: &CompactReport) -> Result<(), SerialOutputError> {
-        self.port
-            .write_all(report)
-            .map_err(SerialOutputError::Write)
+        self.write_bytes(report)
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SerialOutputError> {
+        self.port.write_all(bytes).map_err(SerialOutputError::Write)
     }
 }

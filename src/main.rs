@@ -1,3 +1,4 @@
+mod arm9;
 mod cli;
 mod compact;
 mod ds4_hid;
