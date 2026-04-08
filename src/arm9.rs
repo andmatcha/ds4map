@@ -158,6 +158,7 @@ impl ManualPacketEncoder {
         }
     }
 
+    #[cfg(test)]
     pub fn encode_compact_report(&mut self, compact: &CompactReport) -> ManualPacket {
         self.encode_compact_report_update(compact).packet
     }
