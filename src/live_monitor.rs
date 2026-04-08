@@ -20,6 +20,40 @@ const RIGHT_STICK_CENTER_X: usize = 84;
 const RIGHT_FACE_CENTER_X: usize = 102;
 const STICK_PIXEL_DIAMETER: usize = 29;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    Full,
+    Raw,
+    Compact,
+    None,
+}
+
+impl DisplayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "graphic",
+            Self::Raw => "raw",
+            Self::Compact => "compact",
+            Self::None => "none",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Full => {
+                "DS4 Live Monitor                                          Ctrl-C to exit"
+            }
+            Self::Raw => "DS4 Raw HID Monitor                                       Ctrl-C to exit",
+            Self::Compact => {
+                "DS4 Compact Monitor                                       Ctrl-C to exit"
+            }
+            Self::None => {
+                "DS4 Output                                                Ctrl-C to exit"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MonitorFrame {
     pub sequence: u64,
@@ -50,206 +84,56 @@ impl MonitorFrame {
 }
 
 pub struct MonitorUi {
+    mode: DisplayMode,
     stdout: Stdout,
 }
 
 impl MonitorUi {
-    pub fn new() -> io::Result<Self> {
+    pub fn new(mode: DisplayMode) -> io::Result<Self> {
         let mut stdout = io::stdout();
         write!(stdout, "\x1b[2J\x1b[H\x1b[?25l")?;
         stdout.flush()?;
-        Ok(Self { stdout })
+        Ok(Self { mode, stdout })
     }
 
     pub fn render(&mut self, frame: &MonitorFrame, status: Option<&str>) -> io::Result<()> {
-        let view = CompactView::new(frame.compact);
         let mut screen = String::new();
 
         writeln!(
             screen,
             "{}",
-            pad_visible_line(
-                "DS4 Live Monitor                                          Ctrl-C to exit",
-                CANVAS_WIDTH
-            )
+            pad_visible_line(self.mode.title(), CANVAS_WIDTH)
         )
         .expect("writing to String should not fail");
         writeln!(screen).expect("writing to String should not fail");
 
-        let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
-
-        draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
-        draw_bitmap_trigger_button(&mut canvas, RIGHT_FACE_CENTER_X, 0, "R2", view.r2_raw());
-        draw_bitmap_shoulder_button(&mut canvas, LEFT_PAD_CENTER_X, 6, "L1", view.l1_pressed());
-        draw_bitmap_shoulder_button(&mut canvas, RIGHT_FACE_CENTER_X, 6, "R1", view.r1_pressed());
-
-        draw_dot_pattern(
-            &mut canvas,
-            LEFT_PAD_CENTER_X,
-            13,
-            dpad_up_bitmap(),
-            view.up_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            LEFT_PAD_CENTER_X - 6,
-            16,
-            dpad_left_bitmap(),
-            view.left_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            LEFT_PAD_CENTER_X + 6,
-            16,
-            dpad_right_bitmap(),
-            view.right_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            LEFT_PAD_CENTER_X,
-            19,
-            dpad_down_bitmap(),
-            view.down_pressed(),
-        );
-
-        draw_dot_pattern(
-            &mut canvas,
-            RIGHT_FACE_CENTER_X,
-            12,
-            triangle_bitmap(),
-            view.triangle_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            RIGHT_FACE_CENTER_X - 9,
-            16,
-            square_bitmap(),
-            view.square_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            RIGHT_FACE_CENTER_X + 9,
-            16,
-            circle_bitmap(),
-            view.circle_pressed(),
-        );
-        draw_dot_pattern(
-            &mut canvas,
-            RIGHT_FACE_CENTER_X,
-            20,
-            cross_bitmap(),
-            view.cross_pressed(),
-        );
-
-        draw_bitmap_filled_button(&mut canvas, CENTER_X, 12, view.trackpad_pressed(), 54, 33);
-        draw_bitmap_capsule_button(
-            &mut canvas,
-            CENTER_X - 18,
-            12,
-            "SHARE",
-            view.share_pressed(),
-        );
-        draw_bitmap_capsule_button(
-            &mut canvas,
-            CENTER_X + 18,
-            12,
-            "OPTIONS",
-            view.options_pressed(),
-        );
-
-        draw_bitmap_stick(
-            &mut canvas,
-            LEFT_STICK_CENTER_X,
-            30,
-            view.lx_raw(),
-            view.ly_raw(),
-            view.l3_pressed(),
-            StickSide::Left,
-        );
-        draw_bitmap_stick(
-            &mut canvas,
-            RIGHT_STICK_CENTER_X,
-            30,
-            view.rx_raw(),
-            view.ry_raw(),
-            view.r3_pressed(),
-            StickSide::Right,
-        );
-
-        draw_bitmap_circle_button(&mut canvas, CENTER_X, 29, "PS", view.ps_pressed());
-        let stick_char_width = STICK_PIXEL_DIAMETER.div_ceil(2);
-        put_centered_in_box(
-            &mut canvas,
-            LEFT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
-            stick_char_width,
-            36,
-            "Left Stick",
-            Color::Gray,
-        );
-        put_centered_in_box(
-            &mut canvas,
-            RIGHT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
-            stick_char_width,
-            36,
-            "Right Stick",
-            Color::Gray,
-        );
-        canvas.put_centered(
-            LEFT_STICK_CENTER_X,
-            37,
-            &format!(
-                "X:{:+4}% Y:{:+4}%",
-                stick_percent_x(view.lx_raw()),
-                stick_percent_y(view.ly_raw())
-            ),
-            Color::Gray,
-        );
-        canvas.put_centered(
-            RIGHT_STICK_CENTER_X,
-            37,
-            &format!(
-                "X:{:+4}% Y:{:+4}%",
-                stick_percent_x(view.rx_raw()),
-                stick_percent_y(view.ry_raw())
-            ),
-            Color::Gray,
-        );
-
-        screen.push_str(&canvas.render());
-
-        write_colored_line(
-            &mut screen,
-            &format!(
-                "Seq: {:>6}   Transport: {:<10}   Bytes: {:>3}",
-                frame.sequence, frame.transport, frame.report_len
-            ),
-            GRAY,
-        );
-        match status {
-            Some(message) => write_colored_line(&mut screen, &format!("Status: {message}"), YELLOW),
-            None => write_colored_line(&mut screen, "Status: receiving reports normally", GRAY),
+        match self.mode {
+            DisplayMode::Full => {
+                render_full_monitor(&mut screen, frame);
+                write_common_monitor_lines(&mut screen, frame, status, self.mode);
+                write_wrapped_colored_line(
+                    &mut screen,
+                    "Compact: ",
+                    &format_report_hex(&frame.compact),
+                    GRAY,
+                );
+                write_wrapped_colored_line(
+                    &mut screen,
+                    "HID: ",
+                    &format_report_hex(&frame.raw_report),
+                    GRAY,
+                );
+            }
+            DisplayMode::Raw => {
+                write_common_monitor_lines(&mut screen, frame, status, self.mode);
+                render_raw_monitor(&mut screen, frame);
+            }
+            DisplayMode::Compact => {
+                write_common_monitor_lines(&mut screen, frame, status, self.mode);
+                render_compact_monitor(&mut screen, frame);
+            }
+            DisplayMode::None => {}
         }
-        write_wrapped_colored_line(
-            &mut screen,
-            "Device: ",
-            &format!(
-                "{}   VID:0x{:04X}   PID:0x{:04X}   IF:{}",
-                frame.device_name, frame.vendor_id, frame.product_id, frame.interface_number
-            ),
-            GRAY,
-        );
-        write_wrapped_colored_line(
-            &mut screen,
-            "HID: ",
-            &format_report_hex(&frame.raw_report),
-            GRAY,
-        );
-        write_wrapped_colored_line(
-            &mut screen,
-            "Compact: ",
-            &format_report_hex(&frame.compact),
-            GRAY,
-        );
 
         let fitted_screen = fit_screen_to_terminal(&screen, CANVAS_WIDTH);
         write!(self.stdout, "\x1b[H{fitted_screen}\x1b[J")?;
@@ -262,6 +146,196 @@ impl Drop for MonitorUi {
         let _ = write!(self.stdout, "\x1b[2J\x1b[H\x1b[0m\x1b[?25h");
         let _ = self.stdout.flush();
     }
+}
+
+fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
+    let view = CompactView::new(frame.compact);
+    let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
+    draw_bitmap_trigger_button(&mut canvas, RIGHT_FACE_CENTER_X, 0, "R2", view.r2_raw());
+    draw_bitmap_shoulder_button(&mut canvas, LEFT_PAD_CENTER_X, 6, "L1", view.l1_pressed());
+    draw_bitmap_shoulder_button(&mut canvas, RIGHT_FACE_CENTER_X, 6, "R1", view.r1_pressed());
+
+    draw_dot_pattern(
+        &mut canvas,
+        LEFT_PAD_CENTER_X,
+        13,
+        dpad_up_bitmap(),
+        view.up_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        LEFT_PAD_CENTER_X - 6,
+        16,
+        dpad_left_bitmap(),
+        view.left_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        LEFT_PAD_CENTER_X + 6,
+        16,
+        dpad_right_bitmap(),
+        view.right_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        LEFT_PAD_CENTER_X,
+        19,
+        dpad_down_bitmap(),
+        view.down_pressed(),
+    );
+
+    draw_dot_pattern(
+        &mut canvas,
+        RIGHT_FACE_CENTER_X,
+        12,
+        triangle_bitmap(),
+        view.triangle_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        RIGHT_FACE_CENTER_X - 9,
+        16,
+        square_bitmap(),
+        view.square_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        RIGHT_FACE_CENTER_X + 9,
+        16,
+        circle_bitmap(),
+        view.circle_pressed(),
+    );
+    draw_dot_pattern(
+        &mut canvas,
+        RIGHT_FACE_CENTER_X,
+        20,
+        cross_bitmap(),
+        view.cross_pressed(),
+    );
+
+    draw_bitmap_filled_button(&mut canvas, CENTER_X, 12, view.trackpad_pressed(), 54, 33);
+    draw_bitmap_capsule_button(
+        &mut canvas,
+        CENTER_X - 18,
+        12,
+        "SHARE",
+        view.share_pressed(),
+    );
+    draw_bitmap_capsule_button(
+        &mut canvas,
+        CENTER_X + 18,
+        12,
+        "OPTIONS",
+        view.options_pressed(),
+    );
+
+    draw_bitmap_stick(
+        &mut canvas,
+        LEFT_STICK_CENTER_X,
+        30,
+        view.lx_raw(),
+        view.ly_raw(),
+        view.l3_pressed(),
+        StickSide::Left,
+    );
+    draw_bitmap_stick(
+        &mut canvas,
+        RIGHT_STICK_CENTER_X,
+        30,
+        view.rx_raw(),
+        view.ry_raw(),
+        view.r3_pressed(),
+        StickSide::Right,
+    );
+
+    draw_bitmap_circle_button(&mut canvas, CENTER_X, 29, "PS", view.ps_pressed());
+    let stick_char_width = STICK_PIXEL_DIAMETER.div_ceil(2);
+    put_centered_in_box(
+        &mut canvas,
+        LEFT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
+        stick_char_width,
+        36,
+        "Left Stick",
+        Color::Gray,
+    );
+    put_centered_in_box(
+        &mut canvas,
+        RIGHT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
+        stick_char_width,
+        36,
+        "Right Stick",
+        Color::Gray,
+    );
+    canvas.put_centered(
+        LEFT_STICK_CENTER_X,
+        37,
+        &format!(
+            "X:{:+4}% Y:{:+4}%",
+            stick_percent_x(view.lx_raw()),
+            stick_percent_y(view.ly_raw())
+        ),
+        Color::Gray,
+    );
+    canvas.put_centered(
+        RIGHT_STICK_CENTER_X,
+        37,
+        &format!(
+            "X:{:+4}% Y:{:+4}%",
+            stick_percent_x(view.rx_raw()),
+            stick_percent_y(view.ry_raw())
+        ),
+        Color::Gray,
+    );
+
+    screen.push_str(&canvas.render());
+}
+
+fn render_raw_monitor(screen: &mut String, frame: &MonitorFrame) {
+    write_wrapped_colored_line(screen, "HID: ", &format_report_hex(&frame.raw_report), GRAY);
+    writeln!(screen).expect("writing to String should not fail");
+}
+
+fn render_compact_monitor(screen: &mut String, frame: &MonitorFrame) {
+    write_wrapped_colored_line(
+        screen,
+        "Compact: ",
+        &format_report_hex(&frame.compact),
+        GRAY,
+    );
+    writeln!(screen).expect("writing to String should not fail");
+}
+
+fn write_common_monitor_lines(
+    screen: &mut String,
+    frame: &MonitorFrame,
+    status: Option<&str>,
+    mode: DisplayMode,
+) {
+    if mode == DisplayMode::Full {
+        write_colored_line(
+            screen,
+            &format!(
+                "Seq: {:>6}   Transport: {:<10}   Bytes: {:>3}",
+                frame.sequence, frame.transport, frame.report_len
+            ),
+            GRAY,
+        );
+    }
+    match status {
+        Some(message) => write_colored_line(screen, &format!("Status: {message}"), YELLOW),
+        None => write_colored_line(screen, "Status: receiving", GRAY),
+    }
+    write_wrapped_colored_line(
+        screen,
+        "Device: ",
+        &format!(
+            "{}   VID:0x{:04X}   PID:0x{:04X}   IF:{}",
+            frame.device_name, frame.vendor_id, frame.product_id, frame.interface_number
+        ),
+        GRAY,
+    );
 }
 
 #[derive(Debug, Clone, Copy)]

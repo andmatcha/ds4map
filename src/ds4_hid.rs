@@ -54,13 +54,6 @@ pub fn list_devices() -> Result<Vec<Ds4DeviceInfo>, Ds4Error> {
         .collect())
 }
 
-pub fn monitor_input_reports<F>(on_report: F) -> Result<(), Ds4Error>
-where
-    F: FnMut(InputReportEvent),
-{
-    monitor_input_reports_until(on_report, || false)
-}
-
 pub fn monitor_input_reports_until<F, S>(mut on_report: F, should_stop: S) -> Result<(), Ds4Error>
 where
     F: FnMut(InputReportEvent),
@@ -88,14 +81,6 @@ where
             report,
         });
     }
-}
-
-pub fn format_report_hex(report: &[u8]) -> String {
-    report
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn find_best_device(api: &HidApi) -> Option<&hidapi::DeviceInfo> {
