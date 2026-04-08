@@ -28,6 +28,10 @@ const TOUCHPAD_MAX_Y: u16 = 942;
 const BATTERY_PIXEL_WIDTH: usize = 28;
 const BATTERY_PIXEL_HEIGHT: usize = 12;
 const BATTERY_CAP_WIDTH: usize = 2;
+const SENSOR_ROW_WIDTH: usize = 22;
+const SENSOR_BAR_HALF_WIDTH: usize = 4;
+const GYRO_BAR_MAX: i16 = 4096;
+const ACCEL_BAR_MAX: i16 = 8192;
 const BATTERY_BODY_CELL_WIDTH: usize = (BATTERY_PIXEL_WIDTH - BATTERY_CAP_WIDTH).div_ceil(2);
 const BATTERY_CAP_CELL_X: usize = BATTERY_BODY_CELL_WIDTH;
 const BATTERY_CELL_HEIGHT: usize = BATTERY_PIXEL_HEIGHT.div_ceil(4);
@@ -210,6 +214,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         None
     };
     let battery_status = usb_battery_status(&frame.raw_report);
+    let sensor_readings = usb_sensor_readings(&frame.raw_report);
     let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
 
     draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
@@ -357,6 +362,24 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         ),
         Color::Gray,
     );
+    draw_sensor_group(
+        &mut canvas,
+        LEFT_STICK_CENTER_X.saturating_sub(SENSOR_ROW_WIDTH / 2),
+        39,
+        "GYRO",
+        sensor_readings.map(|sensors| sensors.gyro),
+        ["GX", "GY", "GZ"],
+        GYRO_BAR_MAX,
+    );
+    draw_sensor_group(
+        &mut canvas,
+        RIGHT_STICK_CENTER_X.saturating_sub(SENSOR_ROW_WIDTH / 2),
+        39,
+        "ACCEL",
+        sensor_readings.map(|sensors| sensors.accel),
+        ["AX", "AY", "AZ"],
+        ACCEL_BAR_MAX,
+    );
 
     screen.push_str(&canvas.render());
 }
@@ -423,6 +446,13 @@ impl UsbBatteryStatus {
     fn full(self) -> bool {
         self.full
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsbSensorReadings {
+    temperature: u8,
+    gyro: [i16; 3],
+    accel: [i16; 3],
 }
 
 impl CompactView {
@@ -687,6 +717,91 @@ fn draw_bitmap_battery(
         Color::Green,
     );
     canvas.put_centered(center_x, top_y + 5, &summary, label_color);
+}
+
+fn draw_sensor_group(
+    canvas: &mut Canvas,
+    left_x: usize,
+    top_y: usize,
+    title: &str,
+    values: Option<[i16; 3]>,
+    labels: [&str; 3],
+    max_magnitude: i16,
+) {
+    put_centered_in_box(canvas, left_x, SENSOR_ROW_WIDTH, top_y, title, Color::Gray);
+
+    match values {
+        Some(values) => {
+            for (row, (label, value)) in labels.iter().zip(values.iter()).enumerate() {
+                draw_sensor_row(
+                    canvas,
+                    left_x,
+                    top_y + 1 + row,
+                    label,
+                    *value,
+                    max_magnitude,
+                );
+            }
+        }
+        None => {
+            put_centered_in_box(
+                canvas,
+                left_x,
+                SENSOR_ROW_WIDTH,
+                top_y + 1,
+                "USB 64B ONLY",
+                Color::Gray,
+            );
+        }
+    }
+}
+
+fn draw_sensor_row(
+    canvas: &mut Canvas,
+    left_x: usize,
+    y: usize,
+    label: &str,
+    value: i16,
+    max_magnitude: i16,
+) {
+    canvas.put_text(left_x, y, label, Color::Gray);
+    draw_signed_progress_bar(canvas, left_x + 3, y, value, max_magnitude);
+    canvas.put_text(left_x + 15, y, &format!("{value:+6}"), Color::Gray);
+}
+
+fn draw_signed_progress_bar(
+    canvas: &mut Canvas,
+    left_x: usize,
+    y: usize,
+    value: i16,
+    max_magnitude: i16,
+) {
+    canvas.put(left_x, y, '[', Color::Gray);
+    canvas.put(left_x + SENSOR_BAR_HALF_WIDTH + 1, y, '|', Color::Gray);
+    canvas.put(left_x + SENSOR_BAR_HALF_WIDTH * 2 + 2, y, ']', Color::Gray);
+
+    for offset in 0..SENSOR_BAR_HALF_WIDTH {
+        canvas.put(left_x + 1 + offset, y, '.', Color::Gray);
+        canvas.put(
+            left_x + SENSOR_BAR_HALF_WIDTH + 2 + offset,
+            y,
+            '.',
+            Color::Gray,
+        );
+    }
+
+    let fill_count = signed_bar_fill_count(value, max_magnitude);
+    if value < 0 {
+        for offset in 0..fill_count {
+            let x = left_x + SENSOR_BAR_HALF_WIDTH - offset;
+            canvas.put(x, y, '#', Color::Green);
+        }
+    } else if value > 0 {
+        for offset in 0..fill_count {
+            let x = left_x + SENSOR_BAR_HALF_WIDTH + 2 + offset;
+            canvas.put(x, y, '#', Color::Green);
+        }
+    }
 }
 
 fn draw_bitmap_shoulder_button(
@@ -1138,6 +1253,31 @@ fn usb_battery_status(report: &[u8]) -> Option<UsbBatteryStatus> {
     })
 }
 
+fn usb_sensor_readings(report: &[u8]) -> Option<UsbSensorReadings> {
+    if report.len() < 25 || report.first().copied() != Some(0x01) {
+        return None;
+    }
+
+    Some(UsbSensorReadings {
+        temperature: report[12],
+        gyro: [
+            read_le_i16(report, 13)?,
+            read_le_i16(report, 15)?,
+            read_le_i16(report, 17)?,
+        ],
+        accel: [
+            read_le_i16(report, 19)?,
+            read_le_i16(report, 21)?,
+            read_le_i16(report, 23)?,
+        ],
+    })
+}
+
+fn read_le_i16(report: &[u8], offset: usize) -> Option<i16> {
+    let bytes = report.get(offset..offset + 2)?;
+    Some(i16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
 fn battery_fill_cell_grid(battery: Option<UsbBatteryStatus>) -> Vec<Vec<Option<u8>>> {
     let mut cells = vec![vec![None; BATTERY_BODY_CELL_WIDTH]; BATTERY_CELL_HEIGHT];
     let fill_dot_columns = battery.map_or(0, |status| {
@@ -1239,6 +1379,16 @@ fn draw_braille_bits_grid(
 
 fn braille_char(bits: u8) -> char {
     char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
+}
+
+fn signed_bar_fill_count(value: i16, max_magnitude: i16) -> usize {
+    if max_magnitude <= 0 {
+        return 0;
+    }
+
+    let magnitude = i32::from(value).unsigned_abs() as usize;
+    let max = i32::from(max_magnitude).unsigned_abs() as usize;
+    ((magnitude.min(max) * SENSOR_BAR_HALF_WIDTH) + max / 2) / max
 }
 
 fn stick_outline_pixel_grid(fill_color: Color) -> Vec<Vec<Option<Color>>> {
@@ -1711,9 +1861,10 @@ mod tests {
     use super::{
         BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, battery_fill_cell_grid,
         battery_outline_cell_grid, centered_left_padding, first_usb_touch_position,
-        fit_screen_to_terminal, format_report_hex, pad_visible_line, stick_char_marker_position,
-        stick_percent_x, stick_percent_y, touchpad_char_marker_position, trigger_percent,
-        truncate_ansi_line, usb_battery_status,
+        fit_screen_to_terminal, format_report_hex, pad_visible_line, signed_bar_fill_count,
+        stick_char_marker_position, stick_percent_x, stick_percent_y,
+        touchpad_char_marker_position, trigger_percent, truncate_ansi_line, usb_battery_status,
+        usb_sensor_readings,
     };
     use std::env;
 
@@ -1808,6 +1959,30 @@ mod tests {
     }
 
     #[test]
+    fn usb_sensor_readings_are_parsed_from_raw_report() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[12] = 27;
+        report[13..15].copy_from_slice(&1234i16.to_le_bytes());
+        report[15..17].copy_from_slice(&(-2345i16).to_le_bytes());
+        report[17..19].copy_from_slice(&3456i16.to_le_bytes());
+        report[19..21].copy_from_slice(&(-4567i16).to_le_bytes());
+        report[21..23].copy_from_slice(&5678i16.to_le_bytes());
+        report[23..25].copy_from_slice(&(-6789i16).to_le_bytes());
+
+        let sensors = usb_sensor_readings(&report).expect("sensor readings should parse");
+        assert_eq!(sensors.temperature, 27);
+        assert_eq!(sensors.gyro, [1234, -2345, 3456]);
+        assert_eq!(sensors.accel, [-4567, 5678, -6789]);
+    }
+
+    #[test]
+    fn usb_sensor_readings_require_sensor_bytes() {
+        let report = [0x01u8; 24];
+        assert_eq!(usb_sensor_readings(&report), None);
+    }
+
+    #[test]
     fn battery_bitmap_keeps_tip_gray_when_charge_is_full() {
         let mut report = [0u8; 64];
         report[0] = 0x01;
@@ -1820,6 +1995,13 @@ mod tests {
         assert_eq!(outline.len(), BATTERY_OUTLINE_CHAR_HEIGHT);
         assert_eq!(fill[1].last().copied().flatten(), Some(0xFF));
         assert_eq!(outline[2].last().copied().flatten(), Some(0x47));
+    }
+
+    #[test]
+    fn signed_bar_fill_count_clamps_to_bar_width() {
+        assert_eq!(signed_bar_fill_count(0, 4096), 0);
+        assert_eq!(signed_bar_fill_count(2048, 4096), 2);
+        assert_eq!(signed_bar_fill_count(9000, 4096), 4);
     }
 
     #[test]
