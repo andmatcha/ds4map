@@ -54,9 +54,10 @@ pub fn list_devices() -> Result<Vec<Ds4DeviceInfo>, Ds4Error> {
         .collect())
 }
 
-pub fn monitor_input_reports<F>(mut on_report: F) -> Result<(), Ds4Error>
+pub fn monitor_input_reports_until<F, S>(mut on_report: F, should_stop: S) -> Result<(), Ds4Error>
 where
     F: FnMut(InputReportEvent),
+    S: Fn() -> bool,
 {
     let api = HidApi::new()?;
     let device_info = find_best_device(&api).ok_or(Ds4Error::DeviceNotFound)?;
@@ -65,7 +66,14 @@ where
     let mut sequence = 0u64;
 
     loop {
-        let report = read_next_report(&device)?;
+        if should_stop() {
+            return Ok(());
+        }
+
+        let Some(report) = read_next_report(&device)? else {
+            continue;
+        };
+
         sequence += 1;
         on_report(InputReportEvent {
             sequence,
@@ -75,32 +83,21 @@ where
     }
 }
 
-pub fn format_report_hex(report: &[u8]) -> String {
-    report
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn find_best_device(api: &HidApi) -> Option<&hidapi::DeviceInfo> {
     api.device_list()
         .filter(|device| is_dualshock_4(device.vendor_id(), device.product_id()))
         .max_by_key(|device| device_priority(device))
 }
 
-fn read_next_report(device: &HidDevice) -> Result<Vec<u8>, Ds4Error> {
+fn read_next_report(device: &HidDevice) -> Result<Option<Vec<u8>>, Ds4Error> {
     let mut buffer = [0u8; MAX_REPORT_SIZE];
+    let bytes_read = device.read_timeout(&mut buffer, READ_TIMEOUT_MILLIS)?;
 
-    loop {
-        let bytes_read = device.read_timeout(&mut buffer, READ_TIMEOUT_MILLIS)?;
-
-        if bytes_read == 0 {
-            continue;
-        }
-
-        return Ok(buffer[..bytes_read].to_vec());
+    if bytes_read == 0 {
+        return Ok(None);
     }
+
+    Ok(Some(buffer[..bytes_read].to_vec()))
 }
 
 fn map_device_info(device: &hidapi::DeviceInfo) -> Ds4DeviceInfo {

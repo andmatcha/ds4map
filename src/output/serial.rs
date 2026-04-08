@@ -1,4 +1,3 @@
-use crate::compact::CompactReport;
 use serialport::{Error as SerialError, SerialPort, new};
 use std::fmt;
 use std::io::{self, Write};
@@ -39,10 +38,6 @@ impl SerialOutput {
             .map_err(SerialOutputError::Open)?;
 
         Ok(Self { port })
-    }
-
-    pub fn write_report(&mut self, report: &CompactReport) -> Result<(), SerialOutputError> {
-        self.write_bytes(report)
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), SerialOutputError> {

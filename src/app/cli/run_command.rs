@@ -1,0 +1,439 @@
+use super::help::{is_help_flag, print_run_help};
+use super::runtime::{
+    RunStateGuard, RuntimeRegistration, install_live_monitor_sigint_handler, should_background_run,
+    should_stop_running, spawn_background_run,
+};
+use crate::input::compact::{self, CompactReport};
+use crate::input::ds4_hid::{self, InputReportEvent};
+use crate::output::serial::{SerialConfig, SerialOutput};
+use crate::output::{OutputDriver, OutputFormat};
+use crate::ui::live_monitor::{DisplayMode, MonitorFrame, MonitorUi};
+use std::process::ExitCode;
+
+#[derive(Debug, Clone)]
+struct RunCommandConfig {
+    display_mode: DisplayMode,
+    output_format: Option<OutputFormat>,
+    serial: Option<SerialConfig>,
+}
+
+impl RunCommandConfig {
+    fn effective_output_format(&self) -> Option<OutputFormat> {
+        self.output_format
+            .or(self.serial.as_ref().map(|_| OutputFormat::Arm9))
+    }
+
+    fn runtime_registration(&self) -> RuntimeRegistration {
+        RuntimeRegistration {
+            display_mode: self.display_mode,
+            output_format: self.effective_output_format(),
+            port: self.serial.as_ref().map(|serial| serial.port.clone()),
+            baud_rate: self.serial.as_ref().map(|serial| serial.baud_rate),
+        }
+    }
+}
+
+struct RunOutput {
+    format: OutputFormat,
+    driver: Box<dyn OutputDriver>,
+    serial: Option<SerialOutput>,
+}
+
+struct ProcessedOutput {
+    bytes: Vec<u8>,
+    status: &'static str,
+}
+
+impl RunOutput {
+    fn open(config: &RunCommandConfig) -> Result<Option<Self>, String> {
+        let Some(format) = config.effective_output_format() else {
+            return Ok(None);
+        };
+
+        let serial = match config.serial.as_ref() {
+            Some(serial_config) => Some(SerialOutput::open(serial_config).map_err(|error| {
+                format!(
+                    "failed to open serial port {} at {} baud: {}",
+                    serial_config.port, serial_config.baud_rate, error
+                )
+            })?),
+            None => None,
+        };
+
+        Ok(Some(Self {
+            format,
+            driver: format.create_driver(),
+            serial,
+        }))
+    }
+
+    fn process_compact_report(
+        &mut self,
+        compact_report: &CompactReport,
+    ) -> Result<ProcessedOutput, String> {
+        let bytes = self.driver.encode(compact_report)?;
+        let status = if self.serial.is_some() {
+            "sent"
+        } else {
+            "preview"
+        };
+
+        if let Some(serial) = self.serial.as_mut() {
+            serial.write_bytes(&bytes).map_err(|error| {
+                format!(
+                    "failed to write {} output: {}",
+                    self.driver.format_name(),
+                    error
+                )
+            })?;
+        }
+
+        Ok(ProcessedOutput { bytes, status })
+    }
+}
+
+pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
+    let original_args = args.clone();
+    if args.iter().any(|arg| is_help_flag(arg)) {
+        print_run_help(bin_name);
+        return ExitCode::SUCCESS;
+    }
+
+    let config = match parse_run_args(args) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
+            print_run_help(bin_name);
+            return ExitCode::from(2);
+        }
+    };
+
+    if should_background_run(config.display_mode) {
+        return spawn_background_run(&original_args);
+    }
+
+    install_live_monitor_sigint_handler();
+    let _run_state_guard = match RunStateGuard::acquire(&config.runtime_registration()) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("failed to prepare runtime state: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut output = match RunOutput::open(&config) {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if config.display_mode == DisplayMode::None {
+        return run_output_only(output);
+    }
+
+    let (monitor_result, render_error) = {
+        let mut ui = match MonitorUi::new(config.display_mode) {
+            Ok(ui) => ui,
+            Err(error) => {
+                eprintln!("failed to initialize live monitor UI: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut last_frame = MonitorFrame::idle();
+        last_frame.output_format = config
+            .effective_output_format()
+            .map(|format| String::from(format.as_str()));
+        last_frame.output_state = match config.effective_output_format() {
+            Some(_) if config.serial.is_some() => Some(String::from("idle")),
+            Some(_) => Some(String::from("preview")),
+            None => None,
+        };
+        let mut render_error = None;
+
+        if let Err(error) = ui.render(&last_frame, Some("waiting")) {
+            eprintln!("failed to render live monitor UI: {error}");
+            return ExitCode::from(1);
+        }
+
+        let monitor_result = ds4_hid::monitor_input_reports_until(
+            |event| {
+                if render_error.is_some() {
+                    return;
+                }
+
+                match compact::convert_input_report(&event.report) {
+                    Ok(compact_report) => {
+                        last_frame = monitor_frame_from_event(&event, compact_report);
+                        last_frame.output_format = config
+                            .effective_output_format()
+                            .map(|format| String::from(format.as_str()));
+
+                        let output_status = match output.as_mut() {
+                            Some(output) => match output.process_compact_report(&compact_report) {
+                                Ok(processed) => {
+                                    last_frame.output_format =
+                                        Some(String::from(output.format.as_str()));
+                                    last_frame.output_bytes = processed.bytes;
+                                    last_frame.output_state = Some(String::from(processed.status));
+                                    None
+                                }
+                                Err(_) => {
+                                    last_frame.output_state = Some(String::from("error"));
+                                    Some(String::from("output error"))
+                                }
+                            },
+                            None => None,
+                        };
+
+                        if let Err(error) = ui.render(&last_frame, output_status.as_deref()) {
+                            render_error = Some(error.to_string());
+                        }
+                    }
+                    Err(_) => {
+                        if let Err(render_issue) =
+                            ui.render(&last_frame, Some("unsupported report"))
+                        {
+                            render_error = Some(render_issue.to_string());
+                        }
+                    }
+                }
+            },
+            should_stop_running,
+        );
+
+        (monitor_result, render_error)
+    };
+
+    if let Some(error) = render_error {
+        eprintln!("failed to update live monitor UI: {error}");
+        return ExitCode::from(1);
+    }
+
+    match monitor_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("failed to run DS4 monitor: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_output_only(mut output: Option<RunOutput>) -> ExitCode {
+    let monitor_result = ds4_hid::monitor_input_reports_until(
+        |event| match compact::convert_input_report(&event.report) {
+            Ok(compact_report) => {
+                if let Some(output) = output.as_mut() {
+                    if let Err(error) = output.process_compact_report(&compact_report) {
+                        eprintln!("output error: {error}");
+                    }
+                }
+            }
+            Err(_) => {}
+        },
+        should_stop_running,
+    );
+
+    match monitor_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("failed to run DS4 output: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn monitor_frame_from_event(
+    event: &InputReportEvent,
+    compact_report: CompactReport,
+) -> MonitorFrame {
+    MonitorFrame {
+        sequence: event.sequence,
+        transport: event.device.transport,
+        report_len: event.report.len(),
+        device_name: event
+            .device
+            .product_name
+            .clone()
+            .unwrap_or_else(|| String::from("unknown")),
+        vendor_id: event.device.vendor_id,
+        product_id: event.device.product_id,
+        interface_number: event.device.interface_number,
+        raw_report: event.report.clone(),
+        compact: compact_report,
+        output_format: None,
+        output_state: None,
+        output_bytes: Vec::new(),
+    }
+}
+
+fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
+    let mut display_mode = DisplayMode::Full;
+    let mut output_format = None;
+    let mut port = None;
+    let mut baud_rate = None;
+    let mut iter = args.into_iter();
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--monitor" | "-m" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --monitor"))?;
+                display_mode = DisplayMode::parse(&value)?;
+            }
+            "--format" | "-f" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --format"))?;
+                output_format = Some(OutputFormat::parse(&value)?);
+            }
+            "--port" | "-p" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --port"))?;
+                port = Some(value);
+            }
+            "--baud" | "-b" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --baud"))?;
+                let parsed = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid baud rate: {value}"))?;
+                baud_rate = Some(parsed);
+            }
+            other => return Err(format!("unknown run option: {other}")),
+        }
+    }
+
+    let serial = match (port, baud_rate) {
+        (Some(port), Some(baud_rate)) => Some(SerialConfig { port, baud_rate }),
+        (Some(_), None) => {
+            return Err(String::from(
+                "missing required option for serial output: --baud",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(String::from(
+                "missing required option for serial output: --port",
+            ));
+        }
+        (None, None) => None,
+    };
+
+    if display_mode == DisplayMode::None && serial.is_none() {
+        return Err(String::from(
+            "--monitor none requires serial output via --port and --baud",
+        ));
+    }
+
+    Ok(RunCommandConfig {
+        display_mode,
+        output_format,
+        serial,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_run_args;
+    use crate::output::OutputFormat;
+    use crate::ui::live_monitor::DisplayMode;
+
+    #[test]
+    fn parse_run_args_defaults_to_monitor_only() {
+        let config = parse_run_args(vec![]).expect("run config should parse");
+        assert_eq!(config.display_mode, DisplayMode::Full);
+        assert!(config.serial.is_none());
+        assert_eq!(config.output_format, None);
+    }
+
+    #[test]
+    fn parse_run_args_supports_arm9_output() {
+        let config = parse_run_args(vec![
+            String::from("-f"),
+            String::from("arm9"),
+            String::from("-p"),
+            String::from("/dev/ttyUSB0"),
+            String::from("-b"),
+            String::from("115200"),
+        ])
+        .expect("run config should parse");
+
+        assert_eq!(config.display_mode, DisplayMode::Full);
+        assert_eq!(config.output_format, Some(OutputFormat::Arm9));
+        let serial = config.serial.expect("serial config should exist");
+        assert_eq!(serial.port, "/dev/ttyUSB0");
+        assert_eq!(serial.baud_rate, 115200);
+    }
+
+    #[test]
+    fn parse_run_args_supports_format_without_serial_output() {
+        let config = parse_run_args(vec![String::from("--format"), String::from("arm9")])
+            .expect("parse should succeed");
+        assert_eq!(config.output_format, Some(OutputFormat::Arm9));
+        assert!(config.serial.is_none());
+    }
+
+    #[test]
+    fn parse_run_args_rejects_baud_without_port() {
+        let error = parse_run_args(vec![String::from("--baud"), String::from("115200")])
+            .expect_err("parse should fail");
+        assert!(error.contains("--port"));
+    }
+
+    #[test]
+    fn parse_run_args_supports_raw_display_mode() {
+        let config = parse_run_args(vec![String::from("-m"), String::from("raw")])
+            .expect("run config should parse");
+        assert_eq!(config.display_mode, DisplayMode::Raw);
+    }
+
+    #[test]
+    fn parse_run_args_supports_compact_display_mode() {
+        let config = parse_run_args(vec![String::from("--monitor"), String::from("compact")])
+            .expect("run config should parse");
+        assert_eq!(config.display_mode, DisplayMode::Compact);
+    }
+
+    #[test]
+    fn parse_run_args_supports_none_display_mode_with_serial_output() {
+        let config = parse_run_args(vec![
+            String::from("--monitor"),
+            String::from("none"),
+            String::from("--format"),
+            String::from("arm9"),
+            String::from("--port"),
+            String::from("/dev/ttyUSB0"),
+            String::from("--baud"),
+            String::from("115200"),
+        ])
+        .expect("run config should parse");
+        assert_eq!(config.display_mode, DisplayMode::None);
+        assert!(config.serial.is_some());
+    }
+
+    #[test]
+    fn parse_run_args_rejects_none_display_mode_without_serial_output() {
+        let error = parse_run_args(vec![String::from("--monitor"), String::from("none")])
+            .expect_err("parse should fail");
+        assert!(error.contains("--monitor none requires serial output"));
+    }
+
+    #[test]
+    fn display_mode_parse_supports_graphic() {
+        assert_eq!(
+            DisplayMode::parse("graphic").expect("display mode should parse"),
+            DisplayMode::Full
+        );
+    }
+
+    #[test]
+    fn help_flags_are_detected() {
+        assert!(super::is_help_flag("--help"));
+        assert!(super::is_help_flag("-h"));
+        assert!(!super::is_help_flag("--monitor"));
+    }
+}

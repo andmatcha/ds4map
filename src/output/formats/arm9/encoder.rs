@@ -1,4 +1,4 @@
-use crate::compact::CompactReport;
+use crate::input::compact::CompactReport;
 
 const MANUAL_MODE_VALUE: u8 = 1;
 const MANUAL_PACKET_LEN: usize = 39;
@@ -158,6 +158,7 @@ impl ManualPacketEncoder {
         }
     }
 
+    #[cfg(test)]
     pub fn encode_compact_report(&mut self, compact: &CompactReport) -> ManualPacket {
         self.encode_compact_report_update(compact).packet
     }

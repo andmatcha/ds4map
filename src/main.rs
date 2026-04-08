@@ -1,12 +1,10 @@
-mod arm9;
-mod cli;
-mod compact;
-mod ds4_hid;
-mod mode_sound;
-mod serial_out;
+mod app;
+mod input;
+mod output;
+mod ui;
 
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    cli::run()
+    app::cli::run()
 }
