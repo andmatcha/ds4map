@@ -1,10 +1,17 @@
 use crate::arm9::ManualPacketEncoder;
 use crate::compact;
 use crate::ds4_hid;
+use crate::live_monitor::{MonitorFrame, MonitorUi};
 use crate::mode_sound::ModeSoundPlayer;
 use crate::serial_out::{SerialConfig, SerialOutput};
 use std::env;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static LIVE_MONITOR_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+const SIGINT: i32 = 2;
 
 struct Arm9CommandConfig {
     monitor_only: bool,
@@ -19,6 +26,7 @@ pub fn run() -> ExitCode {
         Some("list") => list_devices(),
         Some("run") => run_compact_output(args.collect()),
         Some("arm9") => run_manual_output(args.collect()),
+        Some("live-monitor") => live_monitor_reports(),
         Some("monitor") => monitor_reports(),
         Some("stop") => {
             println!("stop command is not implemented yet");
@@ -287,6 +295,109 @@ fn list_devices() -> ExitCode {
     }
 }
 
+fn live_monitor_reports() -> ExitCode {
+    LIVE_MONITOR_STOP_REQUESTED.store(false, Ordering::SeqCst);
+    install_live_monitor_sigint_handler();
+
+    let (monitor_result, render_error) = {
+        let mut ui = match MonitorUi::new() {
+            Ok(ui) => ui,
+            Err(error) => {
+                eprintln!("failed to initialize live monitor UI: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let mut last_frame = MonitorFrame::idle();
+        let mut render_error = None;
+
+        if let Err(error) = ui.render(&last_frame, Some("Waiting for the first input report...")) {
+            eprintln!("failed to render live monitor UI: {error}");
+            return ExitCode::from(1);
+        }
+
+        let monitor_result = ds4_hid::monitor_input_reports_until(
+            |event| {
+                if render_error.is_some() {
+                    return;
+                }
+
+                match compact::convert_input_report(&event.report) {
+                    Ok(compact_report) => {
+                        last_frame = MonitorFrame {
+                            sequence: event.sequence,
+                            transport: event.device.transport,
+                            report_len: event.report.len(),
+                            device_name: event
+                                .device
+                                .product_name
+                                .clone()
+                                .unwrap_or_else(|| String::from("unknown")),
+                            vendor_id: event.device.vendor_id,
+                            product_id: event.device.product_id,
+                            interface_number: event.device.interface_number,
+                            raw_report: event.report.clone(),
+                            compact: compact_report,
+                        };
+
+                        if let Err(error) = ui.render(&last_frame, None) {
+                            render_error = Some(error.to_string());
+                        }
+                    }
+                    Err(error) => {
+                        let status = format!(
+                            "Skipped unsupported report #{} (transport={}, bytes={}): {}",
+                            event.sequence,
+                            event.device.transport,
+                            event.report.len(),
+                            error
+                        );
+
+                        if let Err(render_issue) = ui.render(&last_frame, Some(&status)) {
+                            render_error = Some(render_issue.to_string());
+                        }
+                    }
+                }
+            },
+            || LIVE_MONITOR_STOP_REQUESTED.load(Ordering::SeqCst),
+        );
+
+        (monitor_result, render_error)
+    };
+
+    if let Some(error) = render_error {
+        eprintln!("failed to update live monitor UI: {error}");
+        return ExitCode::from(1);
+    }
+
+    match monitor_result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("failed to run DS4 live monitor: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn install_live_monitor_sigint_handler() {
+    type SignalHandler = unsafe extern "C" fn(i32);
+
+    unsafe extern "C" fn handle_sigint(_: i32) {
+        LIVE_MONITOR_STOP_REQUESTED.store(true, Ordering::SeqCst);
+    }
+
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: SignalHandler) -> SignalHandler;
+    }
+
+    unsafe {
+        signal(SIGINT, handle_sigint);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_live_monitor_sigint_handler() {}
+
 fn monitor_reports() -> ExitCode {
     match ds4_hid::monitor_input_reports(|event| {
         println!(
@@ -312,6 +423,7 @@ fn print_usage(bin_name: &str) {
     eprintln!("  list       List connected DUALSHOCK 4 devices");
     eprintln!("  run        Stream DS4_COMPACT_V1 reports to a serial port");
     eprintln!("  arm9       Stream ARM9 MANUAL AC packets, or monitor them with --monitor");
-    eprintln!("  monitor    Continuously monitor HID input reports from a DUALSHOCK 4");
+    eprintln!("  live-monitor  Show a fixed real-time DS4 input monitor");
+    eprintln!("  monitor    Continuously print raw HID input reports from a DUALSHOCK 4");
     eprintln!("  stop       Stop the running action");
 }
