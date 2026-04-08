@@ -1,8 +1,7 @@
-use crate::arm9::ManualPacketEncoder;
 use crate::compact::{self, CompactReport};
 use crate::ds4_hid;
 use crate::live_monitor::{DisplayMode, MonitorFrame, MonitorUi};
-use crate::mode_sound::ModeSoundPlayer;
+use crate::output_format::{OutputDriver, OutputFormat};
 use crate::serial_out::{SerialConfig, SerialOutput};
 use serialport::SerialPortType;
 use std::env;
@@ -33,31 +32,9 @@ struct RunCommandConfig {
     serial: Option<SerialConfig>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputFormat {
-    Arm9,
-}
-
-impl OutputFormat {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "arm9" => Ok(Self::Arm9),
-            other => Err(format!("unsupported output format: {other}")),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Arm9 => "arm9",
-        }
-    }
-}
-
 struct RunOutput {
-    format: OutputFormat,
+    driver: Box<dyn OutputDriver>,
     serial: SerialOutput,
-    arm9_encoder: ManualPacketEncoder,
-    sound_player: ModeSoundPlayer,
 }
 
 impl RunOutput {
@@ -78,27 +55,20 @@ impl RunOutput {
         })?;
 
         Ok(Some(Self {
-            format: config.output_format,
+            driver: config.output_format.create_driver(),
             serial,
-            arm9_encoder: ManualPacketEncoder::new(),
-            sound_player: ModeSoundPlayer::new(),
         }))
     }
 
     fn write_compact_report(&mut self, compact_report: &CompactReport) -> Result<(), String> {
-        match self.format {
-            OutputFormat::Arm9 => {
-                let update = self
-                    .arm9_encoder
-                    .encode_compact_report_update(compact_report);
-                if update.profile_changed {
-                    self.sound_player.play(update.profile.as_str());
-                }
-                self.serial.write_bytes(&update.packet).map_err(|error| {
-                    format!("failed to write {} output: {}", self.format.as_str(), error)
-                })
-            }
-        }
+        let bytes = self.driver.encode(compact_report)?;
+        self.serial.write_bytes(&bytes).map_err(|error| {
+            format!(
+                "failed to write {} output: {}",
+                self.driver.format_name(),
+                error
+            )
+        })
     }
 }
 

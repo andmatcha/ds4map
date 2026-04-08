@@ -4,6 +4,7 @@ mod compact;
 mod ds4_hid;
 mod live_monitor;
 mod mode_sound;
+mod output_format;
 mod serial_out;
 
 use std::process::ExitCode;
