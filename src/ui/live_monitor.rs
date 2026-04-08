@@ -25,6 +25,19 @@ const TOUCHPAD_PIXEL_WIDTH: usize = 54;
 const TOUCHPAD_PIXEL_HEIGHT: usize = 33;
 const TOUCHPAD_MAX_X: u16 = 1919;
 const TOUCHPAD_MAX_Y: u16 = 942;
+const BATTERY_PIXEL_WIDTH: usize = 28;
+const BATTERY_PIXEL_HEIGHT: usize = 12;
+const BATTERY_CAP_WIDTH: usize = 2;
+const BATTERY_BODY_CELL_WIDTH: usize = (BATTERY_PIXEL_WIDTH - BATTERY_CAP_WIDTH).div_ceil(2);
+const BATTERY_CAP_CELL_X: usize = BATTERY_BODY_CELL_WIDTH;
+const BATTERY_CELL_HEIGHT: usize = BATTERY_PIXEL_HEIGHT.div_ceil(4);
+const BATTERY_OUTLINE_CHAR_WIDTH: usize = BATTERY_BODY_CELL_WIDTH + 3;
+const BATTERY_OUTLINE_CHAR_HEIGHT: usize = BATTERY_CELL_HEIGHT + 2;
+const BRAILLE_LEFT_COLUMN_BITS: u8 = 0x47;
+const BRAILLE_RIGHT_COLUMN_BITS: u8 = 0xB8;
+const BRAILLE_TOP_ROW_BITS: u8 = 0x09;
+const BRAILLE_BOTTOM_ROW_BITS: u8 = 0xC0;
+const BRAILLE_FULL_CELL_BITS: u8 = 0xFF;
 const POINTER_CELL_CHAR: &str = "⣿";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,12 +209,14 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     } else {
         None
     };
+    let battery_status = usb_battery_status(&frame.raw_report);
     let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
 
     draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
     draw_bitmap_trigger_button(&mut canvas, RIGHT_FACE_CENTER_X, 0, "R2", view.r2_raw());
     draw_bitmap_shoulder_button(&mut canvas, LEFT_PAD_CENTER_X, 6, "L1", view.l1_pressed());
     draw_bitmap_shoulder_button(&mut canvas, RIGHT_FACE_CENTER_X, 6, "R1", view.r1_pressed());
+    draw_bitmap_battery(&mut canvas, CENTER_X, 0, battery_status);
 
     draw_dot_pattern(
         &mut canvas,
@@ -395,6 +410,19 @@ fn write_common_monitor_lines(
 #[derive(Debug, Clone, Copy)]
 struct CompactView {
     report: CompactReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsbBatteryStatus {
+    level: u8,
+    percent: u8,
+    full: bool,
+}
+
+impl UsbBatteryStatus {
+    fn full(self) -> bool {
+        self.full
+    }
 }
 
 impl CompactView {
@@ -629,6 +657,36 @@ fn draw_bitmap_touchpad(
             touchpad_char_marker_position(touch_x, touch_y, char_width, char_height);
         draw_pointer_cell(canvas, start_x + marker_x, top_y + marker_y);
     }
+}
+
+fn draw_bitmap_battery(
+    canvas: &mut Canvas,
+    center_x: usize,
+    top_y: usize,
+    battery: Option<UsbBatteryStatus>,
+) {
+    let label_color = battery.map_or(Color::Gray, |_| Color::Green);
+    let summary = match battery {
+        Some(status) => format!("BATTERY: {:>3}%", status.percent),
+        None => String::from("BATTERY: N/A"),
+    };
+    let start_x = center_x.saturating_sub(BATTERY_OUTLINE_CHAR_WIDTH / 2);
+
+    draw_braille_bits_grid(
+        canvas,
+        start_x,
+        top_y,
+        &battery_outline_cell_grid(),
+        Color::Gray,
+    );
+    draw_braille_bits_grid(
+        canvas,
+        start_x + 1,
+        top_y + 1,
+        &battery_fill_cell_grid(battery),
+        Color::Green,
+    );
+    canvas.put_centered(center_x, top_y + 5, &summary, label_color);
 }
 
 fn draw_bitmap_shoulder_button(
@@ -1062,6 +1120,125 @@ fn parse_usb_touch_point(point: &[u8]) -> Option<(u16, u16)> {
     let x = u16::from(point[1]) | (u16::from(point[2] & 0x0F) << 8);
     let y = u16::from(point[2] >> 4) | (u16::from(point[3]) << 4);
     Some((x, y))
+}
+
+fn usb_battery_status(report: &[u8]) -> Option<UsbBatteryStatus> {
+    if report.len() < 64 || report.first().copied() != Some(0x01) {
+        return None;
+    }
+
+    let status0 = report[30];
+    let status1 = report[31];
+    let level = (status0 & 0x0F).min(10);
+
+    Some(UsbBatteryStatus {
+        level,
+        percent: level.saturating_mul(10),
+        full: (status1 & 0x0F) == 0x02,
+    })
+}
+
+fn battery_fill_cell_grid(battery: Option<UsbBatteryStatus>) -> Vec<Vec<Option<u8>>> {
+    let mut cells = vec![vec![None; BATTERY_BODY_CELL_WIDTH]; BATTERY_CELL_HEIGHT];
+    let fill_dot_columns = battery.map_or(0, |status| {
+        let max = BATTERY_BODY_CELL_WIDTH * 2;
+        if status.full() {
+            max
+        } else {
+            (usize::from(status.level) * max).div_ceil(10)
+        }
+    });
+
+    for row in &mut cells {
+        for (x, cell) in row.iter_mut().enumerate() {
+            let remaining_columns = fill_dot_columns.saturating_sub(x * 2).min(2);
+            *cell = match remaining_columns {
+                0 => None,
+                1 => Some(BRAILLE_LEFT_COLUMN_BITS),
+                _ => Some(BRAILLE_FULL_CELL_BITS),
+            };
+        }
+    }
+
+    cells
+}
+
+fn battery_outline_cell_grid() -> Vec<Vec<Option<u8>>> {
+    let mut cells = vec![vec![None; BATTERY_OUTLINE_CHAR_WIDTH]; BATTERY_OUTLINE_CHAR_HEIGHT];
+
+    for (y, row) in cells.iter_mut().enumerate() {
+        for (x, cell) in row.iter_mut().enumerate() {
+            if battery_occupied_cell(x, y) {
+                continue;
+            }
+
+            let mut bits = 0u8;
+
+            if x.checked_sub(1)
+                .is_some_and(|left_x| battery_occupied_cell(left_x, y))
+            {
+                bits |= BRAILLE_LEFT_COLUMN_BITS;
+            }
+            if battery_occupied_cell(x + 1, y) {
+                bits |= BRAILLE_RIGHT_COLUMN_BITS;
+            }
+            if y.checked_sub(1)
+                .is_some_and(|top_y| battery_occupied_cell(x, top_y))
+            {
+                bits |= BRAILLE_TOP_ROW_BITS;
+            }
+            if battery_occupied_cell(x, y + 1) {
+                bits |= BRAILLE_BOTTOM_ROW_BITS;
+            }
+
+            if bits != 0 {
+                *cell = Some(bits);
+            }
+        }
+    }
+
+    cells
+}
+
+fn battery_occupied_cell(x: usize, y: usize) -> bool {
+    let Some(body_x) = x.checked_sub(1) else {
+        return false;
+    };
+    let Some(body_y) = y.checked_sub(1) else {
+        return false;
+    };
+
+    if body_y >= BATTERY_CELL_HEIGHT {
+        return false;
+    }
+
+    body_x < BATTERY_BODY_CELL_WIDTH || (body_x == BATTERY_CAP_CELL_X && body_y == 1)
+}
+
+fn draw_braille_bits_grid(
+    canvas: &mut Canvas,
+    start_x: usize,
+    top_y: usize,
+    grid: &[Vec<Option<u8>>],
+    color: Color,
+) {
+    for (row_index, row) in grid.iter().enumerate() {
+        for (col_index, bits) in row.iter().enumerate() {
+            let Some(bits) = bits else {
+                continue;
+            };
+            canvas.put(
+                start_x + col_index,
+                top_y + row_index,
+                braille_char(*bits),
+                color,
+            );
+        }
+    }
+}
+
+fn braille_char(bits: u8) -> char {
+    char::from_u32(0x2800 + u32::from(bits)).unwrap_or(' ')
 }
 
 fn stick_outline_pixel_grid(fill_color: Color) -> Vec<Vec<Option<Color>>> {
@@ -1532,9 +1709,11 @@ fn terminal_size_from_ioctl() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_left_padding, first_usb_touch_position, fit_screen_to_terminal, format_report_hex,
-        pad_visible_line, stick_char_marker_position, stick_percent_x, stick_percent_y,
-        touchpad_char_marker_position, trigger_percent, truncate_ansi_line,
+        BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, battery_fill_cell_grid,
+        battery_outline_cell_grid, centered_left_padding, first_usb_touch_position,
+        fit_screen_to_terminal, format_report_hex, pad_visible_line, stick_char_marker_position,
+        stick_percent_x, stick_percent_y, touchpad_char_marker_position, trigger_percent,
+        truncate_ansi_line, usb_battery_status,
     };
     use std::env;
 
@@ -1607,6 +1786,40 @@ mod tests {
         report[38] = 0x2D;
 
         assert_eq!(first_usb_touch_position(&report), Some((0x0ABC, 0x02D3)));
+    }
+
+    #[test]
+    fn usb_battery_status_is_parsed_from_status_bytes() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[30] = 0x19;
+        report[31] = 0x01;
+
+        let battery = usb_battery_status(&report).expect("battery should parse");
+        assert_eq!(battery.level, 9);
+        assert_eq!(battery.percent, 90);
+        assert!(!battery.full());
+    }
+
+    #[test]
+    fn usb_battery_status_requires_full_usb_report() {
+        let report = [0x01u8; 10];
+        assert_eq!(usb_battery_status(&report), None);
+    }
+
+    #[test]
+    fn battery_bitmap_keeps_tip_gray_when_charge_is_full() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[30] = 0x1A;
+        report[31] = 0x02;
+
+        let fill = battery_fill_cell_grid(usb_battery_status(&report));
+        let outline = battery_outline_cell_grid();
+        assert_eq!(fill.len(), BATTERY_CELL_HEIGHT);
+        assert_eq!(outline.len(), BATTERY_OUTLINE_CHAR_HEIGHT);
+        assert_eq!(fill[1].last().copied().flatten(), Some(0xFF));
+        assert_eq!(outline[2].last().copied().flatten(), Some(0x47));
     }
 
     #[test]
