@@ -65,6 +65,9 @@ pub struct MonitorFrame {
     pub interface_number: i32,
     pub raw_report: Vec<u8>,
     pub compact: CompactReport,
+    pub output_format: Option<String>,
+    pub output_state: Option<String>,
+    pub output_bytes: Vec<u8>,
 }
 
 impl MonitorFrame {
@@ -79,6 +82,9 @@ impl MonitorFrame {
             interface_number: 0,
             raw_report: Vec::new(),
             compact: [0, 0, 128, 128, 128, 128, 0, 0],
+            output_format: None,
+            output_state: None,
+            output_bytes: Vec::new(),
         }
     }
 }
@@ -123,6 +129,22 @@ impl MonitorUi {
                     &format_report_hex(&frame.raw_report),
                     GRAY,
                 );
+                if let Some(format) = frame.output_format.as_deref() {
+                    write_colored_line(&mut screen, "Output:", GRAY);
+                    write_wrapped_colored_line(&mut screen, "  Format: ", format, GRAY);
+                    write_wrapped_colored_line(
+                        &mut screen,
+                        "  Status: ",
+                        frame.output_state.as_deref().unwrap_or("(none)"),
+                        GRAY,
+                    );
+                    write_wrapped_colored_line(
+                        &mut screen,
+                        "  Data: ",
+                        &format_report_hex(&frame.output_bytes),
+                        GRAY,
+                    );
+                }
             }
             DisplayMode::Raw => {
                 write_common_monitor_lines(&mut screen, frame, status, self.mode);

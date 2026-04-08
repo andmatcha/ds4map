@@ -28,47 +28,71 @@ const STOP_REQUEST_FILE: &str = "run.stop";
 #[derive(Debug, Clone)]
 struct RunCommandConfig {
     display_mode: DisplayMode,
-    output_format: OutputFormat,
+    output_format: Option<OutputFormat>,
     serial: Option<SerialConfig>,
 }
 
+impl RunCommandConfig {
+    fn effective_output_format(&self) -> Option<OutputFormat> {
+        self.output_format
+            .or(self.serial.as_ref().map(|_| OutputFormat::Arm9))
+    }
+}
+
 struct RunOutput {
+    format: OutputFormat,
     driver: Box<dyn OutputDriver>,
-    serial: SerialOutput,
+    serial: Option<SerialOutput>,
+}
+
+struct ProcessedOutput {
+    bytes: Vec<u8>,
+    status: &'static str,
 }
 
 impl RunOutput {
     fn open(config: &RunCommandConfig) -> Result<Option<Self>, String> {
-        if config.serial.is_none() {
+        let Some(format) = config.effective_output_format() else {
             return Ok(None);
-        }
+        };
 
-        let serial_config = config
-            .serial
-            .as_ref()
-            .expect("serial config must exist when output is enabled");
-        let serial = SerialOutput::open(serial_config).map_err(|error| {
-            format!(
-                "failed to open serial port {} at {} baud: {}",
-                serial_config.port, serial_config.baud_rate, error
-            )
-        })?;
+        let serial = match config.serial.as_ref() {
+            Some(serial_config) => Some(SerialOutput::open(serial_config).map_err(|error| {
+                format!(
+                    "failed to open serial port {} at {} baud: {}",
+                    serial_config.port, serial_config.baud_rate, error
+                )
+            })?),
+            None => None,
+        };
 
         Ok(Some(Self {
-            driver: config.output_format.create_driver(),
+            format,
+            driver: format.create_driver(),
             serial,
         }))
     }
 
-    fn write_compact_report(&mut self, compact_report: &CompactReport) -> Result<(), String> {
+    fn process_compact_report(
+        &mut self,
+        compact_report: &CompactReport,
+    ) -> Result<ProcessedOutput, String> {
         let bytes = self.driver.encode(compact_report)?;
-        self.serial.write_bytes(&bytes).map_err(|error| {
-            format!(
-                "failed to write {} output: {}",
-                self.driver.format_name(),
-                error
-            )
-        })
+        let status = if self.serial.is_some() {
+            "sent"
+        } else {
+            "preview"
+        };
+        if let Some(serial) = self.serial.as_mut() {
+            serial.write_bytes(&bytes).map_err(|error| {
+                format!(
+                    "failed to write {} output: {}",
+                    self.driver.format_name(),
+                    error
+                )
+            })?;
+        }
+        Ok(ProcessedOutput { bytes, status })
     }
 }
 
@@ -160,6 +184,14 @@ fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             }
         };
         let mut last_frame = MonitorFrame::idle();
+        last_frame.output_format = config
+            .effective_output_format()
+            .map(|format| String::from(format.as_str()));
+        last_frame.output_state = match config.effective_output_format() {
+            Some(_) if config.serial.is_some() => Some(String::from("idle")),
+            Some(_) => Some(String::from("preview")),
+            None => None,
+        };
         let mut render_error = None;
 
         if let Err(error) = ui.render(&last_frame, Some("waiting")) {
@@ -176,12 +208,24 @@ fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
                 match compact::convert_input_report(&event.report) {
                     Ok(compact_report) => {
                         last_frame = monitor_frame_from_event(&event, compact_report);
+                        last_frame.output_format = config
+                            .effective_output_format()
+                            .map(|format| String::from(format.as_str()));
 
                         let output_status = match output.as_mut() {
-                            Some(output) => output
-                                .write_compact_report(&compact_report)
-                                .err()
-                                .map(|_| String::from("output error")),
+                            Some(output) => match output.process_compact_report(&compact_report) {
+                                Ok(processed) => {
+                                    last_frame.output_format =
+                                        Some(String::from(output.format.as_str()));
+                                    last_frame.output_bytes = processed.bytes;
+                                    last_frame.output_state = Some(String::from(processed.status));
+                                    None
+                                }
+                                Err(_) => {
+                                    last_frame.output_state = Some(String::from("error"));
+                                    Some(String::from("output error"))
+                                }
+                            },
                             None => None,
                         };
 
@@ -224,7 +268,7 @@ fn run_output_only(mut output: Option<RunOutput>) -> ExitCode {
         |event| match compact::convert_input_report(&event.report) {
             Ok(compact_report) => {
                 if let Some(output) = output.as_mut() {
-                    if let Err(error) = output.write_compact_report(&compact_report) {
+                    if let Err(error) = output.process_compact_report(&compact_report) {
                         eprintln!("output error: {error}");
                     }
                 }
@@ -261,13 +305,15 @@ fn monitor_frame_from_event(
         interface_number: event.device.interface_number,
         raw_report: event.report.clone(),
         compact: compact_report,
+        output_format: None,
+        output_state: None,
+        output_bytes: Vec::new(),
     }
 }
 
 fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
     let mut display_mode = DisplayMode::Full;
-    let mut output_format = OutputFormat::Arm9;
-    let mut format_specified = false;
+    let mut output_format = None;
     let mut port = None;
     let mut baud_rate = None;
     let mut iter = args.into_iter();
@@ -284,8 +330,7 @@ fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
                 let value = iter
                     .next()
                     .ok_or_else(|| String::from("missing value for --format"))?;
-                output_format = OutputFormat::parse(&value)?;
-                format_specified = true;
+                output_format = Some(OutputFormat::parse(&value)?);
             }
             "--port" | "-p" => {
                 let value = iter
@@ -325,12 +370,6 @@ fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
             ));
         }
         (None, None) => {}
-    }
-
-    if format_specified {
-        return Err(String::from(
-            "--format requires serial output via --port and --baud",
-        ));
     }
 
     if display_mode == DisplayMode::None {
@@ -388,7 +427,10 @@ fn show_running_action_status() -> ExitCode {
             println!("running");
             println!("pid: {}", status.pid);
             println!("monitor: {}", status.display_mode.as_str());
-            println!("format: {}", status.output_format.as_str());
+            match status.output_format {
+                Some(format) => println!("format: {}", format.as_str()),
+                None => println!("format: (none)"),
+            }
             match status.port {
                 Some(port) => println!("port: {port}"),
                 None => println!("port: (none)"),
@@ -729,7 +771,10 @@ impl RunStateGuard {
             format!(
                 "pid={pid}\nmonitor={}\nformat={}\nport={}\nbaud={}\n",
                 config.display_mode.as_str(),
-                config.output_format.as_str(),
+                config
+                    .effective_output_format()
+                    .map(|format| format.as_str())
+                    .unwrap_or(""),
                 config
                     .serial
                     .as_ref()
@@ -762,7 +807,7 @@ impl Drop for RunStateGuard {
 struct RuntimeStatus {
     pid: u32,
     display_mode: DisplayMode,
-    output_format: OutputFormat,
+    output_format: Option<OutputFormat>,
     port: Option<String>,
     baud_rate: Option<u32>,
     is_running: bool,
@@ -794,7 +839,7 @@ fn read_runtime_status() -> Option<RuntimeStatus> {
     Some(RuntimeStatus {
         pid,
         display_mode: display_mode?,
-        output_format: output_format?,
+        output_format,
         port,
         baud_rate,
         is_running: is_process_running(pid),
@@ -839,7 +884,7 @@ mod tests {
         let config = parse_run_args(vec![]).expect("run config should parse");
         assert_eq!(config.display_mode, DisplayMode::Full);
         assert!(config.serial.is_none());
-        assert_eq!(config.output_format, OutputFormat::Arm9);
+        assert_eq!(config.output_format, None);
     }
 
     #[test]
@@ -855,17 +900,18 @@ mod tests {
         .expect("run config should parse");
 
         assert_eq!(config.display_mode, DisplayMode::Full);
-        assert_eq!(config.output_format, OutputFormat::Arm9);
+        assert_eq!(config.output_format, Some(OutputFormat::Arm9));
         let serial = config.serial.expect("serial config should exist");
         assert_eq!(serial.port, "/dev/ttyUSB0");
         assert_eq!(serial.baud_rate, 115200);
     }
 
     #[test]
-    fn parse_run_args_rejects_format_without_serial_output() {
-        let error = parse_run_args(vec![String::from("--format"), String::from("arm9")])
-            .expect_err("parse should fail");
-        assert!(error.contains("--format requires serial output"));
+    fn parse_run_args_supports_format_without_serial_output() {
+        let config = parse_run_args(vec![String::from("--format"), String::from("arm9")])
+            .expect("parse should succeed");
+        assert_eq!(config.output_format, Some(OutputFormat::Arm9));
+        assert!(config.serial.is_none());
     }
 
     #[test]
