@@ -133,6 +133,11 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
         return run_output_only(output);
     }
 
+    if let Err(error) = ds4_hid::ensure_device_ready() {
+        eprintln!("failed to run DS4 monitor: {error}");
+        return ExitCode::from(1);
+    }
+
     let (monitor_result, render_error) = {
         let mut ui = match MonitorUi::new(config.display_mode) {
             Ok(ui) => ui,

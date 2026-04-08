@@ -54,6 +54,13 @@ pub fn list_devices() -> Result<Vec<Ds4DeviceInfo>, Ds4Error> {
         .collect())
 }
 
+pub fn ensure_device_ready() -> Result<(), Ds4Error> {
+    let api = HidApi::new()?;
+    let device_info = find_best_device(&api).ok_or(Ds4Error::DeviceNotFound)?;
+    let _device = device_info.open_device(&api)?;
+    Ok(())
+}
+
 pub fn monitor_input_reports_until<F, S>(mut on_report: F, should_stop: S) -> Result<(), Ds4Error>
 where
     F: FnMut(InputReportEvent),
