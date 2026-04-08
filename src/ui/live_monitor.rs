@@ -1,7 +1,7 @@
 use crate::input::compact::CompactReport;
 use std::env;
 use std::fmt::Write as _;
-use std::io::{self, Stdout, Write};
+use std::io::{self, Stdin, Stdout, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
@@ -128,14 +128,23 @@ impl MonitorFrame {
 pub struct MonitorUi {
     mode: DisplayMode,
     stdout: Stdout,
+    #[cfg(unix)]
+    _terminal_input_guard: Option<TerminalInputGuard>,
 }
 
 impl MonitorUi {
     pub fn new(mode: DisplayMode) -> io::Result<Self> {
         let mut stdout = io::stdout();
+        #[cfg(unix)]
+        let terminal_input_guard = TerminalInputGuard::new()?;
         write!(stdout, "\x1b[2J\x1b[H\x1b[?25l")?;
         stdout.flush()?;
-        Ok(Self { mode, stdout })
+        Ok(Self {
+            mode,
+            stdout,
+            #[cfg(unix)]
+            _terminal_input_guard: terminal_input_guard,
+        })
     }
 
     pub fn render(&mut self, frame: &MonitorFrame, status: Option<&str>) -> io::Result<()> {
@@ -197,6 +206,61 @@ impl MonitorUi {
         write!(self.stdout, "\x1b[H{fitted_screen}\x1b[J")?;
         self.stdout.flush()
     }
+}
+
+#[cfg(unix)]
+struct TerminalInputGuard {
+    stdin: Stdin,
+    original_termios: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalInputGuard {
+    fn new() -> io::Result<Option<Self>> {
+        let stdin = io::stdin();
+        let fd = stdin.as_raw_fd();
+        let is_tty = unsafe { libc::isatty(fd) } == 1;
+        if !is_tty {
+            return Ok(None);
+        }
+
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        let get_result = unsafe { libc::tcgetattr(fd, &mut termios) };
+        if get_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let original_termios = termios;
+        disable_terminal_input_echo(&mut termios);
+
+        let set_result = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) };
+        if set_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Some(Self {
+            stdin,
+            original_termios,
+        }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalInputGuard {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            libc::tcsetattr(
+                self.stdin.as_raw_fd(),
+                libc::TCSANOW,
+                &self.original_termios,
+            )
+        };
+    }
+}
+
+#[cfg(unix)]
+fn disable_terminal_input_echo(termios: &mut libc::termios) {
+    termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
 }
 
 impl Drop for MonitorUi {
@@ -1223,10 +1287,6 @@ fn braille_bit(pixel_x: usize, pixel_y: usize) -> u8 {
     }
 }
 
-fn first_usb_touch_position(report: &[u8]) -> Option<(u16, u16)> {
-    usb_touch_positions(report)[0]
-}
-
 fn usb_touch_positions(report: &[u8]) -> [Option<(u16, u16)>; 2] {
     let mut positions = [None, None];
 
@@ -1888,11 +1948,10 @@ fn terminal_size_from_ioctl() -> Option<(usize, usize)> {
 mod tests {
     use super::{
         BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, battery_fill_cell_grid,
-        battery_outline_cell_grid, centered_left_padding, first_usb_touch_position,
-        fit_screen_to_terminal, format_report_hex, pad_visible_line, signed_bar_fill_count,
-        stick_char_marker_position, stick_percent_x, stick_percent_y,
-        touchpad_char_marker_position, trigger_percent, truncate_ansi_line, usb_battery_status,
-        usb_sensor_readings, usb_touch_positions,
+        battery_outline_cell_grid, centered_left_padding, fit_screen_to_terminal,
+        format_report_hex, pad_visible_line, signed_bar_fill_count, stick_char_marker_position,
+        stick_percent_x, stick_percent_y, touchpad_char_marker_position, trigger_percent,
+        truncate_ansi_line, usb_battery_status, usb_sensor_readings, usb_touch_positions,
     };
     use std::env;
 
@@ -1955,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn usb_touch_position_is_parsed_from_first_active_touch_point() {
+    fn usb_touch_positions_returns_first_active_touch_point_first() {
         let mut report = [0u8; 64];
         report[0] = 0x01;
         report[33] = 1;
@@ -1964,7 +2023,7 @@ mod tests {
         report[37] = 0x3A;
         report[38] = 0x2D;
 
-        assert_eq!(first_usb_touch_position(&report), Some((0x0ABC, 0x02D3)));
+        assert_eq!(usb_touch_positions(&report)[0], Some((0x0ABC, 0x02D3)));
     }
 
     #[test]
@@ -2052,6 +2111,19 @@ mod tests {
         assert_eq!(signed_bar_fill_count(0, 4096), 0);
         assert_eq!(signed_bar_fill_count(2048, 4096), 2);
         assert_eq!(signed_bar_fill_count(9000, 4096), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disable_terminal_input_echo_clears_echo_flags() {
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        termios.c_lflag = libc::ECHO | libc::ECHONL | libc::ISIG;
+
+        super::disable_terminal_input_echo(&mut termios);
+
+        assert_eq!(termios.c_lflag & libc::ECHO, 0);
+        assert_eq!(termios.c_lflag & libc::ECHONL, 0);
+        assert_ne!(termios.c_lflag & libc::ISIG, 0);
     }
 
     #[test]

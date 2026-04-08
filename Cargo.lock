@@ -51,6 +51,7 @@ name = "ds4map"
 version = "0.1.0"
 dependencies = [
  "hidapi",
+ "libc",
  "serialport",
 ]
 

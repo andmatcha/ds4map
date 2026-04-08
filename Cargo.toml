@@ -9,4 +9,5 @@ path = "src/main.rs"
 
 [dependencies]
 hidapi = "2.6.3"
+libc = "0.2"
 serialport = { version = "4.8.1", default-features = false }
