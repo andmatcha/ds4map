@@ -208,10 +208,10 @@ impl Drop for MonitorUi {
 
 fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     let view = CompactView::new(frame.compact);
-    let touchpad_position = if frame.transport == "usb" {
-        first_usb_touch_position(&frame.raw_report)
+    let touchpad_positions = if frame.transport == "usb" {
+        usb_touch_positions(&frame.raw_report)
     } else {
-        None
+        [None, None]
     };
     let battery_status = usb_battery_status(&frame.raw_report);
     let sensor_readings = usb_sensor_readings(&frame.raw_report);
@@ -286,7 +286,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         CENTER_X,
         12,
         view.trackpad_pressed(),
-        touchpad_position,
+        touchpad_positions,
         TOUCHPAD_PIXEL_WIDTH,
         TOUCHPAD_PIXEL_HEIGHT,
     );
@@ -666,7 +666,7 @@ fn draw_bitmap_touchpad(
     center_x: usize,
     top_y: usize,
     pressed: bool,
-    touch_position: Option<(u16, u16)>,
+    touch_positions: [Option<(u16, u16)>; 2],
     pixel_width: usize,
     pixel_height: usize,
 ) {
@@ -682,10 +682,12 @@ fn draw_bitmap_touchpad(
 
     draw_braille_color_grid(canvas, center_x, top_y, &pixels);
 
-    if let Some((touch_x, touch_y)) = touch_position {
-        let (marker_x, marker_y) =
-            touchpad_char_marker_position(touch_x, touch_y, char_width, char_height);
-        draw_pointer_cell(canvas, start_x + marker_x, top_y + marker_y);
+    for touch_position in touch_positions {
+        if let Some((touch_x, touch_y)) = touch_position {
+            let (marker_x, marker_y) =
+                touchpad_char_marker_position(touch_x, touch_y, char_width, char_height);
+            draw_pointer_cell(canvas, start_x + marker_x, top_y + marker_y);
+        }
     }
 }
 
@@ -1209,22 +1211,34 @@ fn braille_bit(pixel_x: usize, pixel_y: usize) -> u8 {
 }
 
 fn first_usb_touch_position(report: &[u8]) -> Option<(u16, u16)> {
+    usb_touch_positions(report)[0]
+}
+
+fn usb_touch_positions(report: &[u8]) -> [Option<(u16, u16)>; 2] {
+    let mut positions = [None, None];
+
     if report.len() < 43 || report.first().copied() != Some(0x01) {
-        return None;
+        return positions;
     }
 
     let report_count = usize::from(report[33]).min(3);
+    let mut next_index = 0usize;
+
     for report_index in 0..report_count {
         let base = 34 + report_index * 9;
         for point_offset in [1usize, 5usize] {
             let point = &report[base + point_offset..base + point_offset + 4];
             if let Some(position) = parse_usb_touch_point(point) {
-                return Some(position);
+                positions[next_index] = Some(position);
+                next_index += 1;
+                if next_index == positions.len() {
+                    return positions;
+                }
             }
         }
     }
 
-    None
+    positions
 }
 
 fn parse_usb_touch_point(point: &[u8]) -> Option<(u16, u16)> {
@@ -1864,7 +1878,7 @@ mod tests {
         fit_screen_to_terminal, format_report_hex, pad_visible_line, signed_bar_fill_count,
         stick_char_marker_position, stick_percent_x, stick_percent_y,
         touchpad_char_marker_position, trigger_percent, truncate_ansi_line, usb_battery_status,
-        usb_sensor_readings,
+        usb_sensor_readings, usb_touch_positions,
     };
     use std::env;
 
@@ -1937,6 +1951,26 @@ mod tests {
         report[38] = 0x2D;
 
         assert_eq!(first_usb_touch_position(&report), Some((0x0ABC, 0x02D3)));
+    }
+
+    #[test]
+    fn usb_touch_positions_capture_two_simultaneous_points() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[33] = 1;
+        report[35] = 0x01;
+        report[36] = 0xBC;
+        report[37] = 0x3A;
+        report[38] = 0x2D;
+        report[39] = 0x02;
+        report[40] = 0x34;
+        report[41] = 0x62;
+        report[42] = 0x19;
+
+        assert_eq!(
+            usb_touch_positions(&report),
+            [Some((0x0ABC, 0x02D3)), Some((0x0234, 0x0196))]
+        );
     }
 
     #[test]
