@@ -1,4 +1,4 @@
-use crate::compact::CompactReport;
+use crate::input::compact::CompactReport;
 
 const MANUAL_MODE_VALUE: u8 = 1;
 const MANUAL_PACKET_LEN: usize = 39;

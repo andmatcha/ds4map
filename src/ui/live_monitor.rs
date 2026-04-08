@@ -1,4 +1,4 @@
-use crate::compact::CompactReport;
+use crate::input::compact::CompactReport;
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
@@ -29,6 +29,18 @@ pub enum DisplayMode {
 }
 
 impl DisplayMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "graphic" => Ok(Self::Full),
+            "raw" => Ok(Self::Raw),
+            "compact" => Ok(Self::Compact),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "invalid monitor mode: {other} (expected graphic/raw/compact/none)"
+            )),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Full => "graphic",
