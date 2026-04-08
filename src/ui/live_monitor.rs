@@ -18,7 +18,14 @@ const LEFT_STICK_CENTER_X: usize = 40;
 const CENTER_X: usize = 62;
 const RIGHT_STICK_CENTER_X: usize = 84;
 const RIGHT_FACE_CENTER_X: usize = 102;
-const STICK_PIXEL_DIAMETER: usize = 29;
+const STICK_PIXEL_DIAMETER: usize = 33;
+const STICK_POINTER_CHAR_WIDTH: usize = 15;
+const STICK_POINTER_CHAR_HEIGHT: usize = 7;
+const TOUCHPAD_PIXEL_WIDTH: usize = 54;
+const TOUCHPAD_PIXEL_HEIGHT: usize = 33;
+const TOUCHPAD_MAX_X: u16 = 1919;
+const TOUCHPAD_MAX_Y: u16 = 942;
+const POINTER_CELL_CHAR: &str = "⣿";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -184,6 +191,11 @@ impl Drop for MonitorUi {
 
 fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     let view = CompactView::new(frame.compact);
+    let touchpad_position = if frame.transport == "usb" {
+        first_usb_touch_position(&frame.raw_report)
+    } else {
+        None
+    };
     let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
 
     draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
@@ -249,7 +261,15 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         view.cross_pressed(),
     );
 
-    draw_bitmap_filled_button(&mut canvas, CENTER_X, 12, view.trackpad_pressed(), 54, 33);
+    draw_bitmap_touchpad(
+        &mut canvas,
+        CENTER_X,
+        12,
+        view.trackpad_pressed(),
+        touchpad_position,
+        TOUCHPAD_PIXEL_WIDTH,
+        TOUCHPAD_PIXEL_HEIGHT,
+    );
     draw_bitmap_capsule_button(
         &mut canvas,
         CENTER_X - 18,
@@ -583,19 +603,32 @@ enum StickSide {
     Right,
 }
 
-fn draw_bitmap_filled_button(
+fn draw_bitmap_touchpad(
     canvas: &mut Canvas,
     center_x: usize,
     top_y: usize,
     pressed: bool,
+    touch_position: Option<(u16, u16)>,
     pixel_width: usize,
     pixel_height: usize,
 ) {
-    let color = if pressed { Color::Green } else { Color::Gray };
-    let bitmap = filled_rectangle_bitmap(pixel_width, pixel_height);
-    let braille_lines = bitmap_to_braille(&bitmap_refs(&bitmap));
+    let fill_color = if pressed { Color::Green } else { Color::Gray };
+    let pixels = vec![vec![Some(fill_color); pixel_width]; pixel_height];
+    let mut pixels = pixels;
+    if let Some(last_row) = pixels.last_mut() {
+        last_row.fill(None);
+    }
+    let char_width = pixel_width.div_ceil(2);
+    let char_height = pixel_height.div_ceil(4);
+    let start_x = center_x.saturating_sub(char_width / 2);
 
-    draw_braille_lines(canvas, center_x, top_y, &braille_lines, color);
+    draw_braille_color_grid(canvas, center_x, top_y, &pixels);
+
+    if let Some((touch_x, touch_y)) = touch_position {
+        let (marker_x, marker_y) =
+            touchpad_char_marker_position(touch_x, touch_y, char_width, char_height);
+        draw_pointer_cell(canvas, start_x + marker_x, top_y + marker_y);
+    }
 }
 
 fn draw_bitmap_shoulder_button(
@@ -712,13 +745,15 @@ fn draw_bitmap_stick(
     side: StickSide,
 ) {
     let border_color = if pressed { Color::Green } else { Color::Gray };
-    let (marker_x, marker_y) = stick_marker_position(x_raw, y_raw);
-    let pixels = stick_outline_pixel_grid(border_color, marker_x, marker_y);
+    let pixels = stick_outline_pixel_grid(border_color);
     let char_width = STICK_PIXEL_DIAMETER.div_ceil(2);
     let char_height = STICK_PIXEL_DIAMETER.div_ceil(4);
     let top_y = center_y.saturating_sub(char_height / 2);
+    let start_x = center_x.saturating_sub(char_width / 2);
 
     draw_braille_color_grid(canvas, center_x, top_y, &pixels);
+    let (marker_x, marker_y) = stick_char_marker_position(x_raw, y_raw, char_width, char_height);
+    draw_pointer_cell(canvas, start_x + marker_x, top_y + marker_y);
 
     match side {
         StickSide::Left => {
@@ -731,17 +766,41 @@ fn draw_bitmap_stick(
     }
 }
 
-fn stick_marker_position(x_raw: u8, y_raw: u8) -> (usize, usize) {
-    let max_index = (STICK_PIXEL_DIAMETER - 1) as f32;
+fn stick_char_marker_position(
+    x_raw: u8,
+    y_raw: u8,
+    char_width: usize,
+    char_height: usize,
+) -> (usize, usize) {
     let x = normalized_x(x_raw);
     let y = normalized_y(y_raw);
-    let radius = max_index / 2.0;
-    let col = (radius + x * radius * 0.60).round() as usize;
-    let row = (radius - y * radius * 0.60).round() as usize;
+    let active_width = STICK_POINTER_CHAR_WIDTH.min(char_width.max(1));
+    let active_height = STICK_POINTER_CHAR_HEIGHT.min(char_height.max(1));
+    let inset_x = (char_width.saturating_sub(active_width)) / 2;
+    let inset_y = (char_height.saturating_sub(active_height)) / 2;
+    let max_x = (active_width.saturating_sub(1)) as f32;
+    let max_y = (active_height.saturating_sub(1)) as f32;
+    let col = (((x + 1.0) * 0.5) * max_x).round() as usize;
+    let row = (((1.0 - y) * 0.5) * max_y).round() as usize;
     (
-        col.min(STICK_PIXEL_DIAMETER - 1),
-        row.min(STICK_PIXEL_DIAMETER - 1),
+        (inset_x + col).min(char_width.saturating_sub(1)),
+        (inset_y + row).min(char_height.saturating_sub(1)),
     )
+}
+
+fn touchpad_char_marker_position(
+    x_raw: u16,
+    y_raw: u16,
+    char_width: usize,
+    char_height: usize,
+) -> (usize, usize) {
+    let x = usize::from(x_raw.min(TOUCHPAD_MAX_X));
+    let y = usize::from(y_raw.min(TOUCHPAD_MAX_Y));
+    let max_x = char_width.saturating_sub(1);
+    let max_y = char_height.saturating_sub(2);
+    let col = (x * max_x + usize::from(TOUCHPAD_MAX_X) / 2) / usize::from(TOUCHPAD_MAX_X);
+    let row = (y * max_y + usize::from(TOUCHPAD_MAX_Y) / 2) / usize::from(TOUCHPAD_MAX_Y);
+    (col.min(max_x), row.min(max_y))
 }
 
 fn normalized_x(value: u8) -> f32 {
@@ -976,73 +1035,57 @@ fn braille_bit(pixel_x: usize, pixel_y: usize) -> u8 {
     }
 }
 
-fn filled_rectangle_bitmap(width: usize, height: usize) -> Vec<String> {
-    vec!["#".repeat(width); height]
-}
+fn first_usb_touch_position(report: &[u8]) -> Option<(u16, u16)> {
+    if report.len() < 43 || report.first().copied() != Some(0x01) {
+        return None;
+    }
 
-fn stick_outline_pixel_grid(
-    border_color: Color,
-    marker_x: usize,
-    marker_y: usize,
-) -> Vec<Vec<Option<Color>>> {
-    let mut pixels = vec![vec![None; STICK_PIXEL_DIAMETER]; STICK_PIXEL_DIAMETER];
-    let outline = stick_outline_bitmap();
-
-    for (row_index, row_pattern) in outline.iter().enumerate() {
-        for (col_index, ch) in row_pattern.chars().enumerate() {
-            if ch == '#' {
-                pixels[row_index][col_index] = Some(border_color);
+    let report_count = usize::from(report[33]).min(3);
+    for report_index in 0..report_count {
+        let base = 34 + report_index * 9;
+        for point_offset in [1usize, 5usize] {
+            let point = &report[base + point_offset..base + point_offset + 4];
+            if let Some(position) = parse_usb_touch_point(point) {
+                return Some(position);
             }
         }
     }
 
-    let pointer_left = marker_x
-        .saturating_sub(1)
-        .min(STICK_PIXEL_DIAMETER.saturating_sub(2));
-    let pointer_top = marker_y
-        .saturating_sub(1)
-        .min(STICK_PIXEL_DIAMETER.saturating_sub(2));
+    None
+}
 
-    for y in pointer_top..pointer_top + 2 {
-        for x in pointer_left..pointer_left + 2 {
-            pixels[y][x] = Some(Color::Cyan);
+fn parse_usb_touch_point(point: &[u8]) -> Option<(u16, u16)> {
+    if point.len() < 4 || (point[0] & 0x80) != 0 {
+        return None;
+    }
+
+    let x = u16::from(point[1]) | (u16::from(point[2] & 0x0F) << 8);
+    let y = u16::from(point[2] >> 4) | (u16::from(point[3]) << 4);
+    Some((x, y))
+}
+
+fn stick_outline_pixel_grid(fill_color: Color) -> Vec<Vec<Option<Color>>> {
+    let mut pixels = vec![vec![None; STICK_PIXEL_DIAMETER]; STICK_PIXEL_DIAMETER];
+    let center_x = (STICK_PIXEL_DIAMETER as f32 - 1.0) / 2.0;
+    let center_y = center_x + 0.35;
+    let radius_x = center_x;
+    let radius_y = center_x + 0.35;
+
+    for (row_index, row) in pixels.iter_mut().enumerate() {
+        for (col_index, cell) in row.iter_mut().enumerate() {
+            let dx = (col_index as f32 - center_x) / radius_x;
+            let dy = (row_index as f32 - center_y) / radius_y;
+            if dx * dx + dy * dy <= 1.0 {
+                *cell = Some(fill_color);
+            }
         }
     }
 
     pixels
 }
 
-fn stick_outline_bitmap() -> &'static [&'static str] {
-    &[
-        "           #######           ",
-        "        #############        ",
-        "      ####         ####      ",
-        "    ####             ####    ",
-        "   ###                 ###   ",
-        "  ##                     ##  ",
-        " ##                       ## ",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        "##                         ##",
-        " ##                       ## ",
-        "  ##                     ##  ",
-        "   ###                 ###   ",
-        "    ####             ####    ",
-        "      ####         ####      ",
-        "        #############        ",
-        "           #######           ",
-    ]
+fn draw_pointer_cell(canvas: &mut Canvas, x: usize, y: usize) {
+    canvas.put_text(x, y, POINTER_CELL_CHAR, Color::Cyan);
 }
 
 fn shoulder_button_bitmap(width: usize, height: usize) -> Vec<String> {
@@ -1489,15 +1532,21 @@ fn terminal_size_from_ioctl() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_left_padding, fit_screen_to_terminal, format_report_hex, pad_visible_line,
-        stick_marker_position, stick_percent_x, stick_percent_y, trigger_percent,
-        truncate_ansi_line,
+        centered_left_padding, first_usb_touch_position, fit_screen_to_terminal, format_report_hex,
+        pad_visible_line, stick_char_marker_position, stick_percent_x, stick_percent_y,
+        touchpad_char_marker_position, trigger_percent, truncate_ansi_line,
     };
     use std::env;
 
     #[test]
     fn stick_center_maps_to_grid_center() {
-        assert_eq!(stick_marker_position(128, 128), (14, 14));
+        assert_eq!(stick_char_marker_position(128, 128, 17, 9), (8, 4));
+    }
+
+    #[test]
+    fn stick_vertical_extremes_reach_top_and_bottom_cells() {
+        assert_eq!(stick_char_marker_position(128, 0, 17, 9), (8, 1));
+        assert_eq!(stick_char_marker_position(128, 255, 17, 9), (8, 7));
     }
 
     #[test]
@@ -1545,5 +1594,24 @@ mod tests {
         }
         let fitted = fit_screen_to_terminal("12345\n67890\nabcde\n", 5);
         assert_eq!(fitted, "  12345\n  67890");
+    }
+
+    #[test]
+    fn usb_touch_position_is_parsed_from_first_active_touch_point() {
+        let mut report = [0u8; 64];
+        report[0] = 0x01;
+        report[33] = 1;
+        report[35] = 0x01;
+        report[36] = 0xBC;
+        report[37] = 0x3A;
+        report[38] = 0x2D;
+
+        assert_eq!(first_usb_touch_position(&report), Some((0x0ABC, 0x02D3)));
+    }
+
+    #[test]
+    fn touchpad_marker_position_stays_inside_bounds() {
+        assert_eq!(touchpad_char_marker_position(0, 0, 27, 9), (0, 0));
+        assert_eq!(touchpad_char_marker_position(1919, 942, 27, 9), (26, 7));
     }
 }
