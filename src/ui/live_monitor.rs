@@ -380,6 +380,18 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         ["AX", "AY", "AZ"],
         ACCEL_BAR_MAX,
     );
+    match sensor_readings {
+        Some(sensors) => canvas.put_centered(
+            CENTER_X,
+            43,
+            &format!(
+                "TS:{:05} TEMP:{:02}C",
+                sensors.timestamp, sensors.temperature
+            ),
+            Color::Gray,
+        ),
+        None => canvas.put_centered(CENTER_X, 43, "TS:N/A TEMP:N/A", Color::Gray),
+    }
 
     screen.push_str(&canvas.render());
 }
@@ -450,6 +462,7 @@ impl UsbBatteryStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UsbSensorReadings {
+    timestamp: u16,
     temperature: u8,
     gyro: [i16; 3],
     accel: [i16; 3],
@@ -1273,6 +1286,7 @@ fn usb_sensor_readings(report: &[u8]) -> Option<UsbSensorReadings> {
     }
 
     Some(UsbSensorReadings {
+        timestamp: u16::from_le_bytes([report[10], report[11]]),
         temperature: report[12],
         gyro: [
             read_le_i16(report, 13)?,
@@ -1996,6 +2010,7 @@ mod tests {
     fn usb_sensor_readings_are_parsed_from_raw_report() {
         let mut report = [0u8; 64];
         report[0] = 0x01;
+        report[10..12].copy_from_slice(&0x1234u16.to_le_bytes());
         report[12] = 27;
         report[13..15].copy_from_slice(&1234i16.to_le_bytes());
         report[15..17].copy_from_slice(&(-2345i16).to_le_bytes());
@@ -2005,6 +2020,7 @@ mod tests {
         report[23..25].copy_from_slice(&(-6789i16).to_le_bytes());
 
         let sensors = usb_sensor_readings(&report).expect("sensor readings should parse");
+        assert_eq!(sensors.timestamp, 0x1234);
         assert_eq!(sensors.temperature, 27);
         assert_eq!(sensors.gyro, [1234, -2345, 3456]);
         assert_eq!(sensors.accel, [-4567, 5678, -6789]);
