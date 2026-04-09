@@ -318,8 +318,6 @@ cargo test
 
 追加の技術資料は `docs/` にまとめています。
 
-- [CONTROLLER_INPUT_TO_CAN_SUMMARY.md](docs/CONTROLLER_INPUT_TO_CAN_SUMMARY.md)
-- [MANUAL_MODE_CONTROLLER_TO_AC.md](docs/MANUAL_MODE_CONTROLLER_TO_AC.md)
-- [received_packet_can_mapping.md](docs/received_packet_can_mapping.md)
-- [DS4_USB_64BYTE_REPORT_LAYOUT.md](docs/DS4_USB_64BYTE_REPORT_LAYOUT.md)
-- [HID_TO_COMPACT_REQUIREMENTS.md](docs/HID_TO_COMPACT_REQUIREMENTS.md)
+- [DS4_HID_REPORT_SPEC.md](docs/DS4_HID_REPORT_SPEC.md)
+- [COMPACT_SPEC.md](docs/COMPACT_SPEC.md)
+- [ARM9_ACV6_PACKET_AND_CAN.md](docs/ARM9_ACV6_PACKET_AND_CAN.md)
