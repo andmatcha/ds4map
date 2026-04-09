@@ -8,7 +8,10 @@ use crate::input::ds4_hid::{self, InputReportEvent};
 use crate::output::serial::{SerialConfig, SerialOutput};
 use crate::output::{OutputDriver, OutputFormat};
 use crate::ui::live_monitor::{DisplayMode, MonitorFrame, MonitorUi};
+use std::cell::RefCell;
 use std::process::ExitCode;
+
+const MONITOR_IDLE_REFRESH_MILLIS: i32 = 50;
 
 #[derive(Debug, Clone)]
 struct RunCommandConfig {
@@ -91,14 +94,81 @@ impl RunOutput {
         Ok(ProcessedOutput { bytes, status })
     }
 
-    fn sync_port_rx_into_frame(&self, frame: &mut MonitorFrame) {
+    fn sync_port_rx_into_frame(&self, frame: &mut MonitorFrame) -> bool {
         let Some(serial) = self.serial.as_ref() else {
-            return;
+            return false;
         };
 
         let snapshot = serial.port_rx_snapshot();
+        let changed = frame.port_rx_state.as_deref() != Some(snapshot.status.as_str())
+            || frame.port_rx_bytes != snapshot.bytes;
         frame.port_rx_state = Some(snapshot.status);
         frame.port_rx_bytes = snapshot.bytes;
+        changed
+    }
+}
+
+struct LiveMonitorSession {
+    ui: MonitorUi,
+    last_frame: MonitorFrame,
+    output: Option<RunOutput>,
+    render_error: Option<String>,
+    effective_output_format: Option<OutputFormat>,
+    serial_enabled: bool,
+}
+
+impl LiveMonitorSession {
+    fn handle_input_report(&mut self, event: &InputReportEvent, compact_report: CompactReport) {
+        if self.render_error.is_some() {
+            return;
+        }
+
+        self.last_frame = monitor_frame_from_event(event, compact_report);
+        self.last_frame.output_format = self
+            .effective_output_format
+            .map(|format| String::from(format.as_str()));
+
+        let output_status = match self.output.as_mut() {
+            Some(output) => match output.process_compact_report(&compact_report) {
+                Ok(processed) => {
+                    self.last_frame.output_format = Some(String::from(output.format.as_str()));
+                    self.last_frame.output_bytes = processed.bytes;
+                    self.last_frame.output_state = Some(String::from(processed.status));
+                    None
+                }
+                Err(_) => {
+                    self.last_frame.output_state = Some(String::from("error"));
+                    if self.serial_enabled {
+                        self.last_frame.port_rx_state = Some(String::from("error"));
+                    }
+                    Some(String::from("output error"))
+                }
+            },
+            None => None,
+        };
+
+        if let Some(output) = self.output.as_ref() {
+            output.sync_port_rx_into_frame(&mut self.last_frame);
+        }
+
+        if let Err(error) = self.ui.render(&self.last_frame, output_status.as_deref()) {
+            self.render_error = Some(error.to_string());
+        }
+    }
+
+    fn handle_idle_refresh(&mut self) {
+        if self.render_error.is_some() {
+            return;
+        }
+
+        let should_render = self
+            .output
+            .as_ref()
+            .is_some_and(|output| output.sync_port_rx_into_frame(&mut self.last_frame));
+
+        if should_render && let Err(error) = self.ui.render(&self.last_frame, None) {
+            self.render_error = Some(error.to_string());
+        }
     }
 }
 
@@ -131,7 +201,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
         }
     };
 
-    let mut output = match RunOutput::open(&config) {
+    let output = match RunOutput::open(&config) {
         Ok(output) => output,
         Err(error) => {
             eprintln!("{error}");
@@ -166,66 +236,46 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             None => None,
         };
         last_frame.port_rx_state = config.serial.as_ref().map(|_| String::from("waiting"));
-        let mut render_error = None;
 
         if let Err(error) = ui.render(&last_frame, Some("waiting")) {
             eprintln!("failed to render live monitor UI: {error}");
             return ExitCode::from(1);
         }
 
-        let monitor_result = ds4_hid::monitor_input_reports_until(
-            |event| {
-                if render_error.is_some() {
-                    return;
+        let session = RefCell::new(LiveMonitorSession {
+            ui,
+            last_frame,
+            output,
+            render_error: None,
+            effective_output_format: config.effective_output_format(),
+            serial_enabled: config.serial.is_some(),
+        });
+
+        let monitor_result = ds4_hid::monitor_input_reports_with_idle_until(
+            |event| match compact::convert_input_report(&event.report) {
+                Ok(compact_report) => {
+                    session
+                        .borrow_mut()
+                        .handle_input_report(&event, compact_report);
                 }
-
-                match compact::convert_input_report(&event.report) {
-                    Ok(compact_report) => {
-                        last_frame = monitor_frame_from_event(&event, compact_report);
-                        last_frame.output_format = config
-                            .effective_output_format()
-                            .map(|format| String::from(format.as_str()));
-
-                        let output_status = match output.as_mut() {
-                            Some(output) => match output.process_compact_report(&compact_report) {
-                                Ok(processed) => {
-                                    last_frame.output_format =
-                                        Some(String::from(output.format.as_str()));
-                                    last_frame.output_bytes = processed.bytes;
-                                    last_frame.output_state = Some(String::from(processed.status));
-                                    None
-                                }
-                                Err(_) => {
-                                    last_frame.output_state = Some(String::from("error"));
-                                    if config.serial.is_some() {
-                                        last_frame.port_rx_state = Some(String::from("error"));
-                                    }
-                                    Some(String::from("output error"))
-                                }
-                            },
-                            None => None,
-                        };
-                        if let Some(output) = output.as_ref() {
-                            output.sync_port_rx_into_frame(&mut last_frame);
-                        }
-
-                        if let Err(error) = ui.render(&last_frame, output_status.as_deref()) {
-                            render_error = Some(error.to_string());
-                        }
-                    }
-                    Err(_) => {
-                        if let Err(render_issue) =
-                            ui.render(&last_frame, Some("unsupported report"))
-                        {
-                            render_error = Some(render_issue.to_string());
-                        }
+                Err(_) => {
+                    let mut session = session.borrow_mut();
+                    let frame = session.last_frame.clone();
+                    if let Err(render_issue) = session.ui.render(&frame, Some("unsupported report"))
+                    {
+                        session.render_error = Some(render_issue.to_string());
                     }
                 }
             },
+            || {
+                session.borrow_mut().handle_idle_refresh();
+            },
             should_stop_running,
+            MONITOR_IDLE_REFRESH_MILLIS,
         );
 
-        (monitor_result, render_error)
+        let session = session.into_inner();
+        (monitor_result, session.render_error)
     };
 
     if let Some(error) = render_error {

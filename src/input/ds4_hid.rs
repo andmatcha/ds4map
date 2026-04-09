@@ -66,6 +66,20 @@ where
     F: FnMut(InputReportEvent),
     S: Fn() -> bool,
 {
+    monitor_input_reports_with_idle_until(&mut on_report, || {}, should_stop, READ_TIMEOUT_MILLIS)
+}
+
+pub fn monitor_input_reports_with_idle_until<F, I, S>(
+    mut on_report: F,
+    mut on_idle: I,
+    should_stop: S,
+    read_timeout_millis: i32,
+) -> Result<(), Ds4Error>
+where
+    F: FnMut(InputReportEvent),
+    I: FnMut(),
+    S: Fn() -> bool,
+{
     let api = HidApi::new()?;
     let device_info = find_best_device(&api).ok_or(Ds4Error::DeviceNotFound)?;
     let device = device_info.open_device(&api)?;
@@ -77,7 +91,8 @@ where
             return Ok(());
         }
 
-        let Some(report) = read_next_report(&device)? else {
+        let Some(report) = read_next_report_with_timeout(&device, read_timeout_millis)? else {
+            on_idle();
             continue;
         };
 
@@ -96,9 +111,12 @@ fn find_best_device(api: &HidApi) -> Option<&hidapi::DeviceInfo> {
         .max_by_key(|device| device_priority(device))
 }
 
-fn read_next_report(device: &HidDevice) -> Result<Option<Vec<u8>>, Ds4Error> {
+fn read_next_report_with_timeout(
+    device: &HidDevice,
+    timeout_millis: i32,
+) -> Result<Option<Vec<u8>>, Ds4Error> {
     let mut buffer = [0u8; MAX_REPORT_SIZE];
-    let bytes_read = device.read_timeout(&mut buffer, READ_TIMEOUT_MILLIS)?;
+    let bytes_read = device.read_timeout(&mut buffer, timeout_millis)?;
 
     if bytes_read == 0 {
         return Ok(None);
