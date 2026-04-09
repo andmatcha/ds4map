@@ -104,6 +104,8 @@ pub struct MonitorFrame {
     pub output_format: Option<String>,
     pub output_state: Option<String>,
     pub output_bytes: Vec<u8>,
+    pub port_rx_state: Option<String>,
+    pub port_rx_bytes: Vec<u8>,
 }
 
 impl MonitorFrame {
@@ -121,6 +123,8 @@ impl MonitorFrame {
             output_format: None,
             output_state: None,
             output_bytes: Vec::new(),
+            port_rx_state: None,
+            port_rx_bytes: Vec::new(),
         }
     }
 }
@@ -187,6 +191,16 @@ impl MonitorUi {
                         &mut screen,
                         "  Data: ",
                         &format_report_hex(&frame.output_bytes),
+                        GRAY,
+                    );
+                }
+                if let Some(state) = frame.port_rx_state.as_deref() {
+                    write_colored_line(&mut screen, "Port RX:", GRAY);
+                    write_wrapped_colored_line(&mut screen, "  Status: ", state, GRAY);
+                    write_wrapped_colored_line(
+                        &mut screen,
+                        "  Data: ",
+                        &format_report_hex(&frame.port_rx_bytes),
                         GRAY,
                     );
                 }

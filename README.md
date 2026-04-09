@@ -7,6 +7,7 @@
 - DS4 の入力状態をリアルタイムに表示
 - `graphic` / `raw` / `compact` / `none` の monitor モード
 - シリアルポートへの出力
+- `--port` 指定時のシリアル受信データ表示
 - `--monitor none` でのバックグラウンド実行
 - `status` / `stop` による実行状態の確認と停止
 - format を追加しやすい出力構成
@@ -219,7 +220,7 @@ ds4 run -m compact
 ds4 run -f arm9
 ```
 
-`arm9` 出力をシリアルポートへ送信する:
+`arm9` 出力をシリアルポートへ送信しつつ、graphic 下部に受信データも表示する:
 
 ```bash
 ds4 run -f arm9 -p /dev/ttyUSB0 -b 115200

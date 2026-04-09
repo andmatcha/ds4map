@@ -101,7 +101,7 @@ pub(crate) fn print_run_help(bin_name: &str) {
     println!("  -m, --monitor <graphic|raw|compact|none>  Select the monitor display mode");
     println!("  -f, --format <arm9>                       Select the output format");
     println!(
-        "  -p, --port <PORT>                         Enable serial output and choose the port"
+        "  -p, --port <PORT>                         Enable serial output and show port RX in graphic monitor"
     );
     println!("  -b, --baud <BAUD_RATE>                    Serial baud rate for output");
     println!("  -h, --help                                Show this help");

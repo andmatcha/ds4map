@@ -90,6 +90,16 @@ impl RunOutput {
 
         Ok(ProcessedOutput { bytes, status })
     }
+
+    fn sync_port_rx_into_frame(&self, frame: &mut MonitorFrame) {
+        let Some(serial) = self.serial.as_ref() else {
+            return;
+        };
+
+        let snapshot = serial.port_rx_snapshot();
+        frame.port_rx_state = Some(snapshot.status);
+        frame.port_rx_bytes = snapshot.bytes;
+    }
 }
 
 pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
@@ -155,6 +165,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             Some(_) => Some(String::from("preview")),
             None => None,
         };
+        last_frame.port_rx_state = config.serial.as_ref().map(|_| String::from("waiting"));
         let mut render_error = None;
 
         if let Err(error) = ui.render(&last_frame, Some("waiting")) {
@@ -186,11 +197,17 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
                                 }
                                 Err(_) => {
                                     last_frame.output_state = Some(String::from("error"));
+                                    if config.serial.is_some() {
+                                        last_frame.port_rx_state = Some(String::from("error"));
+                                    }
                                     Some(String::from("output error"))
                                 }
                             },
                             None => None,
                         };
+                        if let Some(output) = output.as_ref() {
+                            output.sync_port_rx_into_frame(&mut last_frame);
+                        }
 
                         if let Err(error) = ui.render(&last_frame, output_status.as_deref()) {
                             render_error = Some(error.to_string());
@@ -270,6 +287,8 @@ fn monitor_frame_from_event(
         output_format: None,
         output_state: None,
         output_bytes: Vec::new(),
+        port_rx_state: None,
+        port_rx_bytes: Vec::new(),
     }
 }
 
