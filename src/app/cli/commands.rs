@@ -43,6 +43,10 @@ pub(crate) fn show_running_action_status() -> ExitCode {
                 Some(baud_rate) => println!("baud: {baud_rate}"),
                 None => println!("baud: (none)"),
             }
+            match status.log_file {
+                Some(log_file) => println!("log_file: {log_file}"),
+                None => println!("log_file: (none)"),
+            }
             println!(
                 "state: {}",
                 if runtime::stop_requested() {

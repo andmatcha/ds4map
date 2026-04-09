@@ -8,6 +8,7 @@
 - `graphic` / `raw` / `compact` / `none` の monitor モード
 - シリアルポートへの出力
 - `--port` 指定時のシリアル受信データ表示（バイト列と ASCII 文字列）
+- `--log-file` 指定時のフレーム単位ログ出力
 - `--monitor none` でのバックグラウンド実行
 - `status` / `stop` による実行状態の確認と停止
 - format を追加しやすい出力構成
@@ -224,6 +225,12 @@ ds4 run -f arm9
 
 ```bash
 ds4 run -f arm9 -p /dev/ttyUSB0 -b 115200
+```
+
+HID と送受信データをログファイルへ追記する:
+
+```bash
+ds4 run -f arm9 -p /dev/ttyUSB0 -b 115200 --log-file logs/ds4.log
 ```
 
 モニタ表示なしでバックグラウンド実行する:

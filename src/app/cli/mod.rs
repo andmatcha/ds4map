@@ -1,6 +1,7 @@
 mod commands;
 mod help;
 mod run_command;
+mod run_logger;
 mod runtime;
 
 use std::env;

@@ -1984,8 +1984,8 @@ mod tests {
         battery_outline_cell_grid, centered_left_padding, fit_screen_to_terminal,
         format_report_ascii, format_report_hex, pad_visible_line, signed_bar_fill_count,
         stick_char_marker_position, stick_percent_x, stick_percent_y,
-        touchpad_char_marker_position, trigger_percent, truncate_ansi_line,
-        usb_battery_status, usb_sensor_readings, usb_touch_positions,
+        touchpad_char_marker_position, trigger_percent, truncate_ansi_line, usb_battery_status,
+        usb_sensor_readings, usb_touch_positions,
     };
     use std::env;
 

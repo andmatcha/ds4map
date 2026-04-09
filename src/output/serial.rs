@@ -10,6 +10,8 @@ const READ_TIMEOUT_MILLIS: u64 = 50;
 const WRITE_TIMEOUT_MILLIS: u64 = 1_000;
 const READ_BUFFER_SIZE: usize = 256;
 
+pub type PortRxCallback = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct SerialConfig {
     pub port: String,
@@ -56,7 +58,10 @@ pub struct SerialOutput {
 }
 
 impl SerialOutput {
-    pub fn open(config: &SerialConfig) -> Result<Self, SerialOutputError> {
+    pub fn open(
+        config: &SerialConfig,
+        port_rx_callback: Option<PortRxCallback>,
+    ) -> Result<Self, SerialOutputError> {
         let port = new(&config.port, config.baud_rate)
             .timeout(Duration::from_millis(WRITE_TIMEOUT_MILLIS))
             .open()
@@ -73,6 +78,7 @@ impl SerialOutput {
             reader,
             Arc::clone(&port_rx),
             Arc::clone(&reader_stop_requested),
+            port_rx_callback,
         ));
 
         Ok(Self {
@@ -108,6 +114,7 @@ fn spawn_reader_thread(
     mut reader: Box<dyn SerialPort>,
     port_rx: Arc<Mutex<PortRxSnapshot>>,
     stop_requested: Arc<AtomicBool>,
+    port_rx_callback: Option<PortRxCallback>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buffer = [0u8; READ_BUFFER_SIZE];
@@ -120,19 +127,38 @@ fn spawn_reader_thread(
                     if let Err(error) =
                         drain_available_bytes(&mut *reader, &mut received, &mut buffer)
                     {
-                        update_port_rx_status(&port_rx, format!("error: {error}"), None);
+                        let status = format!("error: {error}");
+                        notify_port_rx_callback(
+                            port_rx_callback.as_ref(),
+                            status.clone(),
+                            Vec::new(),
+                        );
+                        update_port_rx_status(&port_rx, status, None);
                         break;
                     }
+                    notify_port_rx_callback(
+                        port_rx_callback.as_ref(),
+                        String::from("received"),
+                        received.clone(),
+                    );
                     update_port_rx_status(&port_rx, String::from("received"), Some(received));
                 }
                 Err(error) if is_transient_read_error(&error) => {}
                 Err(error) => {
-                    update_port_rx_status(&port_rx, format!("error: {error}"), None);
+                    let status = format!("error: {error}");
+                    notify_port_rx_callback(port_rx_callback.as_ref(), status.clone(), Vec::new());
+                    update_port_rx_status(&port_rx, status, None);
                     break;
                 }
             }
         }
     })
+}
+
+fn notify_port_rx_callback(callback: Option<&PortRxCallback>, status: String, bytes: Vec<u8>) {
+    if let Some(callback) = callback {
+        callback(status, bytes);
+    }
 }
 
 fn drain_available_bytes(
