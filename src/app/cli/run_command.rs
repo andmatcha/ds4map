@@ -1,14 +1,14 @@
 use super::help::{is_help_flag, print_run_help};
 use super::run_logger::RunLogger;
 use super::runtime::{
-    RunStateGuard, RuntimeRegistration, install_live_monitor_sigint_handler, should_background_run,
-    should_stop_running, spawn_background_run,
+    RunStateGuard, RuntimeRegistration, install_live_monitor_sigint_handler,
+    request_live_monitor_stop, should_background_run, should_stop_running, spawn_background_run,
 };
 use crate::input::compact::{self, CompactReport};
 use crate::input::ds4_hid::{self, InputReportEvent};
 use crate::output::serial::{PortRxCallback, SerialConfig, SerialOutput};
 use crate::output::{OutputDriver, OutputFormat};
-use crate::ui::live_monitor::{DisplayMode, MonitorFrame, MonitorUi};
+use crate::ui::live_monitor::{DisplayMode, MonitorAction, MonitorFrame, MonitorUi};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -115,6 +115,12 @@ impl RunOutput {
         let snapshot = serial.port_rx_snapshot();
         let changed = frame.port_rx_state.as_deref() != Some(snapshot.status.as_str())
             || frame.port_rx_bytes != snapshot.bytes;
+        if snapshot.status == "received"
+            && frame.port_rx_bytes != snapshot.bytes
+            && !snapshot.bytes.is_empty()
+        {
+            frame.push_rx_history(format_report_ascii_text(&snapshot.bytes));
+        }
         frame.port_rx_state = Some(snapshot.status);
         frame.port_rx_bytes = snapshot.bytes;
         changed
@@ -126,6 +132,7 @@ struct LiveMonitorSession {
     last_frame: MonitorFrame,
     output: Option<RunOutput>,
     logger: Option<Arc<RunLogger>>,
+    paused: bool,
     render_error: Option<String>,
     effective_output_format: Option<OutputFormat>,
     serial_enabled: bool,
@@ -133,11 +140,20 @@ struct LiveMonitorSession {
 
 impl LiveMonitorSession {
     fn handle_input_report(&mut self, event: &InputReportEvent, compact_report: CompactReport) {
+        self.poll_ui_action();
         if self.render_error.is_some() {
             return;
         }
 
+        let hid_history = self.last_frame.hid_history.clone();
+        let tx_history = self.last_frame.tx_history.clone();
+        let rx_history = self.last_frame.rx_history.clone();
         self.last_frame = monitor_frame_from_event(event, compact_report);
+        self.last_frame.hid_history = hid_history;
+        self.last_frame.tx_history = tx_history;
+        self.last_frame.rx_history = rx_history;
+        self.last_frame
+            .push_hid_history(self.last_frame.raw_report.clone());
         self.last_frame.output_format = self
             .effective_output_format
             .map(|format| String::from(format.as_str()));
@@ -148,6 +164,8 @@ impl LiveMonitorSession {
                     self.last_frame.output_format = Some(String::from(output.format.as_str()));
                     self.last_frame.output_bytes = processed.bytes;
                     self.last_frame.output_state = Some(String::from(processed.status));
+                    self.last_frame
+                        .push_tx_history(self.last_frame.output_bytes.clone());
                     if let Some(logger) = self.logger.as_ref() {
                         let _ = logger.log_output_bytes(
                             event.sequence,
@@ -173,12 +191,17 @@ impl LiveMonitorSession {
             output.sync_port_rx_into_frame(&mut self.last_frame);
         }
 
+        if self.paused {
+            return;
+        }
+
         if let Err(error) = self.ui.render(&self.last_frame, output_status.as_deref()) {
             self.render_error = Some(error.to_string());
         }
     }
 
     fn handle_idle_refresh(&mut self) {
+        self.poll_ui_action();
         if self.render_error.is_some() {
             return;
         }
@@ -188,8 +211,40 @@ impl LiveMonitorSession {
             .as_ref()
             .is_some_and(|output| output.sync_port_rx_into_frame(&mut self.last_frame));
 
+        if self.paused {
+            return;
+        }
+
         if should_render && let Err(error) = self.ui.render(&self.last_frame, None) {
             self.render_error = Some(error.to_string());
+        }
+    }
+
+    fn poll_ui_action(&mut self) {
+        let action = match self.ui.poll_action() {
+            Ok(action) => action,
+            Err(error) => {
+                self.render_error = Some(error.to_string());
+                return;
+            }
+        };
+
+        match action {
+            Some(MonitorAction::TogglePause) => {
+                self.paused = !self.paused;
+                let status = if self.paused {
+                    Some("paused (space: resume, q: quit)")
+                } else {
+                    Some("resumed")
+                };
+                if let Err(error) = self.ui.render(&self.last_frame, status) {
+                    self.render_error = Some(error.to_string());
+                }
+            }
+            Some(MonitorAction::Quit) => {
+                request_live_monitor_stop();
+            }
+            None => {}
         }
     }
 }
@@ -281,6 +336,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             last_frame,
             output,
             logger,
+            paused: false,
             render_error: None,
             effective_output_format: config.effective_output_format(),
             serial_enabled: config.serial.is_some(),
@@ -397,6 +453,32 @@ fn monitor_frame_from_event(
         output_bytes: Vec::new(),
         port_rx_state: None,
         port_rx_bytes: Vec::new(),
+        hid_history: Vec::new(),
+        tx_history: Vec::new(),
+        rx_history: Vec::new(),
+    }
+}
+
+fn format_report_ascii_text(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::from("(none)");
+    }
+
+    let normalized = String::from_utf8_lossy(bytes)
+        .chars()
+        .filter_map(|ch| match ch {
+            '\r' => None,
+            '\n' | '\t' => Some(ch),
+            _ if ch.is_control() => Some(' '),
+            _ => Some(ch),
+        })
+        .collect::<String>();
+
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        String::from("(empty)")
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -487,7 +569,7 @@ fn logger_port_rx_callback(logger: Option<&Arc<RunLogger>>) -> Option<PortRxCall
 
 #[cfg(test)]
 mod tests {
-    use super::parse_run_args;
+    use super::{format_report_ascii_text, parse_run_args};
     use crate::output::OutputFormat;
     use crate::ui::live_monitor::DisplayMode;
 
@@ -598,5 +680,15 @@ mod tests {
         assert!(super::is_help_flag("--help"));
         assert!(super::is_help_flag("-h"));
         assert!(!super::is_help_flag("--monitor"));
+    }
+
+    #[test]
+    fn format_report_ascii_text_renders_plain_text() {
+        assert_eq!(format_report_ascii_text(b"OK\r\nREADY"), "OK\nREADY");
+    }
+
+    #[test]
+    fn format_report_ascii_text_replaces_non_text_control_chars() {
+        assert_eq!(format_report_ascii_text(b"A\x01B"), "A B");
     }
 }

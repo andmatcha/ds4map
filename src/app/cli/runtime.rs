@@ -85,6 +85,10 @@ pub(crate) fn should_stop_running() -> bool {
     LIVE_MONITOR_STOP_REQUESTED.load(Ordering::SeqCst) || stop_request_path().exists()
 }
 
+pub(crate) fn request_live_monitor_stop() {
+    LIVE_MONITOR_STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 pub(crate) fn request_stop() -> Result<(), String> {
     fs::create_dir_all(runtime_state_dir())
         .map_err(|error| format!("failed to prepare runtime state: {error}"))?;
