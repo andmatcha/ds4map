@@ -7,7 +7,7 @@
 - DS4 の入力状態をリアルタイムに表示
 - `graphic` / `raw` / `compact` / `none` の monitor モード
 - シリアルポートへの出力
-- `--port` 指定時のシリアル受信データ表示
+- `--port` 指定時のシリアル受信データ表示（バイト列と ASCII 文字列）
 - `--monitor none` でのバックグラウンド実行
 - `status` / `stop` による実行状態の確認と停止
 - format を追加しやすい出力構成

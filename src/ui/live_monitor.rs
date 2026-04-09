@@ -203,6 +203,12 @@ impl MonitorUi {
                         &format_report_hex(&frame.port_rx_bytes),
                         GRAY,
                     );
+                    write_wrapped_colored_line(
+                        &mut screen,
+                        "  ASCII: ",
+                        &format_report_ascii(&frame.port_rx_bytes),
+                        GRAY,
+                    );
                 }
             }
             DisplayMode::Raw => {
@@ -1828,6 +1834,19 @@ fn format_report_hex(report: &[u8]) -> String {
         .join(" ")
 }
 
+fn format_report_ascii(report: &[u8]) -> String {
+    if report.is_empty() {
+        return String::from("(none)");
+    }
+
+    let escaped = report
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect::<String>();
+    format!("\"{escaped}\"")
+}
+
 fn centered_left_padding(terminal_width: usize, content_width: usize) -> usize {
     terminal_width.saturating_sub(content_width) / 2
 }
@@ -1963,9 +1982,10 @@ mod tests {
     use super::{
         BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, battery_fill_cell_grid,
         battery_outline_cell_grid, centered_left_padding, fit_screen_to_terminal,
-        format_report_hex, pad_visible_line, signed_bar_fill_count, stick_char_marker_position,
-        stick_percent_x, stick_percent_y, touchpad_char_marker_position, trigger_percent,
-        truncate_ansi_line, usb_battery_status, usb_sensor_readings, usb_touch_positions,
+        format_report_ascii, format_report_hex, pad_visible_line, signed_bar_fill_count,
+        stick_char_marker_position, stick_percent_x, stick_percent_y,
+        touchpad_char_marker_position, trigger_percent, truncate_ansi_line,
+        usb_battery_status, usb_sensor_readings, usb_touch_positions,
     };
     use std::env;
 
@@ -2002,6 +2022,16 @@ mod tests {
     #[test]
     fn format_report_hex_handles_empty_reports() {
         assert_eq!(format_report_hex(&[]), "(none)");
+    }
+
+    #[test]
+    fn format_report_ascii_handles_empty_reports() {
+        assert_eq!(format_report_ascii(&[]), "(none)");
+    }
+
+    #[test]
+    fn format_report_ascii_escapes_non_printable_bytes() {
+        assert_eq!(format_report_ascii(b"OK\r\n"), "\"OK\\r\\n\"");
     }
 
     #[test]
