@@ -1,20 +1,27 @@
 use super::help::{is_help_flag, print_run_help};
+use super::run_logger::RunLogger;
 use super::runtime::{
-    RunStateGuard, RuntimeRegistration, install_live_monitor_sigint_handler, should_background_run,
-    should_stop_running, spawn_background_run,
+    RunStateGuard, RuntimeRegistration, install_live_monitor_sigint_handler,
+    request_live_monitor_stop, should_background_run, should_stop_running, spawn_background_run,
 };
 use crate::input::compact::{self, CompactReport};
 use crate::input::ds4_hid::{self, InputReportEvent};
-use crate::output::serial::{SerialConfig, SerialOutput};
+use crate::output::serial::{PortRxCallback, SerialConfig, SerialOutput};
 use crate::output::{OutputDriver, OutputFormat};
-use crate::ui::live_monitor::{DisplayMode, MonitorFrame, MonitorUi};
+use crate::ui::live_monitor::{DisplayMode, MonitorAction, MonitorFrame, MonitorUi};
+use std::cell::RefCell;
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+
+const MONITOR_IDLE_REFRESH_MILLIS: i32 = 50;
 
 #[derive(Debug, Clone)]
 struct RunCommandConfig {
     display_mode: DisplayMode,
     output_format: Option<OutputFormat>,
     serial: Option<SerialConfig>,
+    log_file: Option<PathBuf>,
 }
 
 impl RunCommandConfig {
@@ -29,6 +36,10 @@ impl RunCommandConfig {
             output_format: self.effective_output_format(),
             port: self.serial.as_ref().map(|serial| serial.port.clone()),
             baud_rate: self.serial.as_ref().map(|serial| serial.baud_rate),
+            log_file: self
+                .log_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
         }
     }
 }
@@ -45,18 +56,23 @@ struct ProcessedOutput {
 }
 
 impl RunOutput {
-    fn open(config: &RunCommandConfig) -> Result<Option<Self>, String> {
+    fn open(
+        config: &RunCommandConfig,
+        port_rx_callback: Option<PortRxCallback>,
+    ) -> Result<Option<Self>, String> {
         let Some(format) = config.effective_output_format() else {
             return Ok(None);
         };
 
         let serial = match config.serial.as_ref() {
-            Some(serial_config) => Some(SerialOutput::open(serial_config).map_err(|error| {
-                format!(
-                    "failed to open serial port {} at {} baud: {}",
-                    serial_config.port, serial_config.baud_rate, error
-                )
-            })?),
+            Some(serial_config) => Some(
+                SerialOutput::open(serial_config, port_rx_callback).map_err(|error| {
+                    format!(
+                        "failed to open serial port {} at {} baud: {}",
+                        serial_config.port, serial_config.baud_rate, error
+                    )
+                })?,
+            ),
             None => None,
         };
 
@@ -90,6 +106,153 @@ impl RunOutput {
 
         Ok(ProcessedOutput { bytes, status })
     }
+
+    fn sync_port_rx_into_frame(
+        &self,
+        frame: &mut MonitorFrame,
+        rx_text_pending: &mut String,
+    ) -> bool {
+        let Some(serial) = self.serial.as_ref() else {
+            return false;
+        };
+
+        let received_chunks = serial.take_port_rx_chunks();
+        let snapshot = serial.port_rx_snapshot();
+        let mut changed = !received_chunks.is_empty()
+            || frame.port_rx_state.as_deref() != Some(snapshot.status.as_str())
+            || frame.port_rx_bytes != snapshot.bytes;
+        for chunk in received_chunks {
+            for line in consume_received_text(&chunk, rx_text_pending) {
+                frame.push_rx_history(line);
+                changed = true;
+            }
+        }
+        frame.port_rx_state = Some(snapshot.status);
+        frame.port_rx_bytes = snapshot.bytes;
+        changed
+    }
+}
+
+struct LiveMonitorSession {
+    ui: MonitorUi,
+    last_frame: MonitorFrame,
+    output: Option<RunOutput>,
+    logger: Option<Arc<RunLogger>>,
+    paused: bool,
+    rx_text_pending: String,
+    render_error: Option<String>,
+    effective_output_format: Option<OutputFormat>,
+    serial_enabled: bool,
+}
+
+impl LiveMonitorSession {
+    fn handle_input_report(&mut self, event: &InputReportEvent, compact_report: CompactReport) {
+        self.poll_ui_action();
+        if self.render_error.is_some() {
+            return;
+        }
+
+        let hid_history = self.last_frame.hid_history.clone();
+        let tx_history = self.last_frame.tx_history.clone();
+        let rx_history = self.last_frame.rx_history.clone();
+        self.last_frame = monitor_frame_from_event(event, compact_report);
+        self.last_frame.hid_history = hid_history;
+        self.last_frame.tx_history = tx_history;
+        self.last_frame.rx_history = rx_history;
+        self.last_frame
+            .push_hid_history(self.last_frame.raw_report.clone());
+        self.last_frame.output_format = self
+            .effective_output_format
+            .map(|format| String::from(format.as_str()));
+
+        let output_status = match self.output.as_mut() {
+            Some(output) => match output.process_compact_report(&compact_report) {
+                Ok(processed) => {
+                    self.last_frame.output_format = Some(String::from(output.format.as_str()));
+                    self.last_frame.output_bytes = processed.bytes;
+                    self.last_frame.output_state = Some(String::from(processed.status));
+                    self.last_frame
+                        .push_tx_history(self.last_frame.output_bytes.clone());
+                    if let Some(logger) = self.logger.as_ref() {
+                        let _ = logger.log_output_bytes(
+                            event.sequence,
+                            output.format.as_str(),
+                            processed.status,
+                            &self.last_frame.output_bytes,
+                        );
+                    }
+                    None
+                }
+                Err(_) => {
+                    self.last_frame.output_state = Some(String::from("error"));
+                    if self.serial_enabled {
+                        self.last_frame.port_rx_state = Some(String::from("error"));
+                    }
+                    Some(String::from("output error"))
+                }
+            },
+            None => None,
+        };
+
+        if let Some(output) = self.output.as_ref() {
+            output.sync_port_rx_into_frame(&mut self.last_frame, &mut self.rx_text_pending);
+        }
+
+        if self.paused {
+            return;
+        }
+
+        if let Err(error) = self.ui.render(&self.last_frame, output_status.as_deref()) {
+            self.render_error = Some(error.to_string());
+        }
+    }
+
+    fn handle_idle_refresh(&mut self) {
+        self.poll_ui_action();
+        if self.render_error.is_some() {
+            return;
+        }
+
+        let should_render = self.output.as_ref().is_some_and(|output| {
+            output.sync_port_rx_into_frame(&mut self.last_frame, &mut self.rx_text_pending)
+        });
+
+        if self.paused {
+            return;
+        }
+
+        if should_render && let Err(error) = self.ui.render(&self.last_frame, None) {
+            self.render_error = Some(error.to_string());
+        }
+    }
+
+    fn poll_ui_action(&mut self) {
+        let action = match self.ui.poll_action() {
+            Ok(action) => action,
+            Err(error) => {
+                self.render_error = Some(error.to_string());
+                return;
+            }
+        };
+
+        match action {
+            Some(MonitorAction::TogglePause) => {
+                self.paused = !self.paused;
+                let status = if self.paused {
+                    Some("paused (space: resume, q: quit)")
+                } else {
+                    Some("resumed")
+                };
+                if let Err(error) = self.ui.render(&self.last_frame, status) {
+                    self.render_error = Some(error.to_string());
+                }
+            }
+            Some(MonitorAction::Quit) => {
+                request_live_monitor_stop();
+            }
+            None => {}
+        }
+    }
 }
 
 pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
@@ -113,6 +276,18 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
     }
 
     install_live_monitor_sigint_handler();
+    let logger = match config
+        .log_file
+        .as_ref()
+        .map(|path| RunLogger::open(path).map(Arc::new))
+        .transpose()
+    {
+        Ok(logger) => logger,
+        Err(error) => {
+            eprintln!("failed to open log file: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let _run_state_guard = match RunStateGuard::acquire(&config.runtime_registration()) {
         Ok(guard) => guard,
         Err(error) => {
@@ -121,7 +296,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
         }
     };
 
-    let mut output = match RunOutput::open(&config) {
+    let output = match RunOutput::open(&config, logger_port_rx_callback(logger.as_ref())) {
         Ok(output) => output,
         Err(error) => {
             eprintln!("{error}");
@@ -130,7 +305,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
     };
 
     if config.display_mode == DisplayMode::None {
-        return run_output_only(output);
+        return run_output_only(output, logger);
     }
 
     if let Err(error) = ds4_hid::ensure_device_ready() {
@@ -155,60 +330,56 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             Some(_) => Some(String::from("preview")),
             None => None,
         };
-        let mut render_error = None;
+        last_frame.port_rx_state = config.serial.as_ref().map(|_| String::from("waiting"));
 
         if let Err(error) = ui.render(&last_frame, Some("waiting")) {
             eprintln!("failed to render live monitor UI: {error}");
             return ExitCode::from(1);
         }
 
-        let monitor_result = ds4_hid::monitor_input_reports_until(
-            |event| {
-                if render_error.is_some() {
-                    return;
-                }
+        let session = RefCell::new(LiveMonitorSession {
+            ui,
+            last_frame,
+            output,
+            logger,
+            paused: false,
+            rx_text_pending: String::new(),
+            render_error: None,
+            effective_output_format: config.effective_output_format(),
+            serial_enabled: config.serial.is_some(),
+        });
 
+        let monitor_result = ds4_hid::monitor_input_reports_with_idle_until(
+            |event| {
+                if let Some(logger) = session.borrow().logger.as_ref() {
+                    let _ = logger.log_input_report(&event);
+                }
                 match compact::convert_input_report(&event.report) {
                     Ok(compact_report) => {
-                        last_frame = monitor_frame_from_event(&event, compact_report);
-                        last_frame.output_format = config
-                            .effective_output_format()
-                            .map(|format| String::from(format.as_str()));
-
-                        let output_status = match output.as_mut() {
-                            Some(output) => match output.process_compact_report(&compact_report) {
-                                Ok(processed) => {
-                                    last_frame.output_format =
-                                        Some(String::from(output.format.as_str()));
-                                    last_frame.output_bytes = processed.bytes;
-                                    last_frame.output_state = Some(String::from(processed.status));
-                                    None
-                                }
-                                Err(_) => {
-                                    last_frame.output_state = Some(String::from("error"));
-                                    Some(String::from("output error"))
-                                }
-                            },
-                            None => None,
-                        };
-
-                        if let Err(error) = ui.render(&last_frame, output_status.as_deref()) {
-                            render_error = Some(error.to_string());
-                        }
+                        session
+                            .borrow_mut()
+                            .handle_input_report(&event, compact_report);
                     }
                     Err(_) => {
+                        let mut session = session.borrow_mut();
+                        let frame = session.last_frame.clone();
                         if let Err(render_issue) =
-                            ui.render(&last_frame, Some("unsupported report"))
+                            session.ui.render(&frame, Some("unsupported report"))
                         {
-                            render_error = Some(render_issue.to_string());
+                            session.render_error = Some(render_issue.to_string());
                         }
                     }
                 }
             },
+            || {
+                session.borrow_mut().handle_idle_refresh();
+            },
             should_stop_running,
+            MONITOR_IDLE_REFRESH_MILLIS,
         );
 
-        (monitor_result, render_error)
+        let session = session.into_inner();
+        (monitor_result, session.render_error)
     };
 
     if let Some(error) = render_error {
@@ -225,17 +396,34 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
     }
 }
 
-fn run_output_only(mut output: Option<RunOutput>) -> ExitCode {
+fn run_output_only(mut output: Option<RunOutput>, logger: Option<Arc<RunLogger>>) -> ExitCode {
     let monitor_result = ds4_hid::monitor_input_reports_until(
-        |event| match compact::convert_input_report(&event.report) {
-            Ok(compact_report) => {
-                if let Some(output) = output.as_mut() {
-                    if let Err(error) = output.process_compact_report(&compact_report) {
-                        eprintln!("output error: {error}");
+        |event| {
+            if let Some(logger) = logger.as_ref() {
+                let _ = logger.log_input_report(&event);
+            }
+            match compact::convert_input_report(&event.report) {
+                Ok(compact_report) => {
+                    if let Some(output) = output.as_mut() {
+                        match output.process_compact_report(&compact_report) {
+                            Ok(processed) => {
+                                if let Some(logger) = logger.as_ref() {
+                                    let _ = logger.log_output_bytes(
+                                        event.sequence,
+                                        output.format.as_str(),
+                                        processed.status,
+                                        &processed.bytes,
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!("output error: {error}");
+                            }
+                        }
                     }
                 }
+                Err(_) => {}
             }
-            Err(_) => {}
         },
         should_stop_running,
     );
@@ -270,7 +458,43 @@ fn monitor_frame_from_event(
         output_format: None,
         output_state: None,
         output_bytes: Vec::new(),
+        port_rx_state: None,
+        port_rx_bytes: Vec::new(),
+        hid_history: Vec::new(),
+        tx_history: Vec::new(),
+        rx_history: Vec::new(),
     }
+}
+
+fn normalize_received_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter_map(|ch| match ch {
+            '\r' => None,
+            '\n' | '\t' => Some(ch),
+            _ if ch.is_control() => Some(' '),
+            _ => Some(ch),
+        })
+        .collect()
+}
+
+fn consume_received_text(bytes: &[u8], pending: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for ch in normalize_received_text(bytes).chars() {
+        if ch == '\n' {
+            let trimmed = pending.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_owned());
+            }
+            pending.clear();
+            continue;
+        }
+
+        pending.push(ch);
+    }
+
+    lines
 }
 
 fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
@@ -278,6 +502,7 @@ fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
     let mut output_format = None;
     let mut port = None;
     let mut baud_rate = None;
+    let mut log_file = None;
     let mut iter = args.into_iter();
 
     while let Some(arg) = iter.next() {
@@ -309,6 +534,12 @@ fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
                     .map_err(|_| format!("invalid baud rate: {value}"))?;
                 baud_rate = Some(parsed);
             }
+            "--log-file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --log-file"))?;
+                log_file = Some(PathBuf::from(value));
+            }
             other => return Err(format!("unknown run option: {other}")),
         }
     }
@@ -338,12 +569,22 @@ fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
         display_mode,
         output_format,
         serial,
+        log_file,
+    })
+}
+
+fn logger_port_rx_callback(logger: Option<&Arc<RunLogger>>) -> Option<PortRxCallback> {
+    logger.map(|logger| {
+        let logger = Arc::clone(logger);
+        Arc::new(move |status: String, bytes: Vec<u8>| {
+            let _ = logger.log_serial_rx(&status, &bytes);
+        }) as PortRxCallback
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_run_args;
+    use super::{consume_received_text, normalize_received_text, parse_run_args};
     use crate::output::OutputFormat;
     use crate::ui::live_monitor::DisplayMode;
 
@@ -353,6 +594,7 @@ mod tests {
         assert_eq!(config.display_mode, DisplayMode::Full);
         assert!(config.serial.is_none());
         assert_eq!(config.output_format, None);
+        assert!(config.log_file.is_none());
     }
 
     #[test]
@@ -428,6 +670,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_args_supports_log_file() {
+        let config = parse_run_args(vec![
+            String::from("--log-file"),
+            String::from("logs/ds4.log"),
+        ])
+        .expect("run config should parse");
+        assert_eq!(
+            config.log_file,
+            Some(std::path::PathBuf::from("logs/ds4.log"))
+        );
+    }
+
+    #[test]
     fn display_mode_parse_supports_graphic() {
         assert_eq!(
             DisplayMode::parse("graphic").expect("display mode should parse"),
@@ -440,5 +695,34 @@ mod tests {
         assert!(super::is_help_flag("--help"));
         assert!(super::is_help_flag("-h"));
         assert!(!super::is_help_flag("--monitor"));
+    }
+
+    #[test]
+    fn normalize_received_text_renders_plain_text() {
+        assert_eq!(normalize_received_text(b"OK\r\nREADY"), "OK\nREADY");
+    }
+
+    #[test]
+    fn normalize_received_text_replaces_non_text_control_chars() {
+        assert_eq!(normalize_received_text(b"A\x01B"), "A B");
+    }
+
+    #[test]
+    fn consume_received_text_keeps_partial_line_until_next_chunk() {
+        let mut pending = String::new();
+        assert!(consume_received_text(b"RE", &mut pending).is_empty());
+        assert_eq!(pending, "RE");
+
+        let lines = consume_received_text(b"ADY\nOK\n", &mut pending);
+        assert_eq!(lines, vec![String::from("READY"), String::from("OK")]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn consume_received_text_skips_empty_lines() {
+        let mut pending = String::new();
+        let lines = consume_received_text(b"\nA\n\n", &mut pending);
+        assert_eq!(lines, vec![String::from("A")]);
+        assert!(pending.is_empty());
     }
 }

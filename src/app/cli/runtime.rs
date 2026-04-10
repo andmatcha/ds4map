@@ -27,6 +27,7 @@ pub(crate) struct RuntimeRegistration {
     pub output_format: Option<OutputFormat>,
     pub port: Option<String>,
     pub baud_rate: Option<u32>,
+    pub log_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub(crate) struct RuntimeStatus {
     pub output_format: Option<OutputFormat>,
     pub port: Option<String>,
     pub baud_rate: Option<u32>,
+    pub log_file: Option<String>,
     pub is_running: bool,
 }
 
@@ -83,6 +85,10 @@ pub(crate) fn should_stop_running() -> bool {
     LIVE_MONITOR_STOP_REQUESTED.load(Ordering::SeqCst) || stop_request_path().exists()
 }
 
+pub(crate) fn request_live_monitor_stop() {
+    LIVE_MONITOR_STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
 pub(crate) fn request_stop() -> Result<(), String> {
     fs::create_dir_all(runtime_state_dir())
         .map_err(|error| format!("failed to prepare runtime state: {error}"))?;
@@ -101,6 +107,7 @@ pub(crate) fn read_runtime_status() -> Option<RuntimeStatus> {
     let mut output_format = None;
     let mut port = None;
     let mut baud_rate = None;
+    let mut log_file = None;
 
     for line in info.lines() {
         let Some((key, value)) = line.split_once('=') else {
@@ -112,6 +119,7 @@ pub(crate) fn read_runtime_status() -> Option<RuntimeStatus> {
             "format" => output_format = OutputFormat::parse(value).ok(),
             "port" if !value.is_empty() => port = Some(String::from(value)),
             "baud" if !value.is_empty() => baud_rate = value.parse::<u32>().ok(),
+            "log_file" if !value.is_empty() => log_file = Some(String::from(value)),
             _ => {}
         }
     }
@@ -123,6 +131,7 @@ pub(crate) fn read_runtime_status() -> Option<RuntimeStatus> {
         output_format,
         port,
         baud_rate,
+        log_file,
         is_running: is_process_running(pid),
     })
 }
@@ -152,7 +161,7 @@ impl RunStateGuard {
         fs::write(
             &info_path,
             format!(
-                "pid={pid}\nmonitor={}\nformat={}\nport={}\nbaud={}\n",
+                "pid={pid}\nmonitor={}\nformat={}\nport={}\nbaud={}\nlog_file={}\n",
                 config.display_mode.as_str(),
                 config
                     .output_format
@@ -163,6 +172,7 @@ impl RunStateGuard {
                     .baud_rate
                     .map(|baud| baud.to_string())
                     .unwrap_or_default(),
+                config.log_file.as_deref().unwrap_or(""),
             ),
         )?;
         Ok(Self {

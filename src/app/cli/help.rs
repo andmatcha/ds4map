@@ -101,15 +101,19 @@ pub(crate) fn print_run_help(bin_name: &str) {
     println!("  -m, --monitor <graphic|raw|compact|none>  Select the monitor display mode");
     println!("  -f, --format <arm9>                       Select the output format");
     println!(
-        "  -p, --port <PORT>                         Enable serial output and choose the port"
+        "  -p, --port <PORT>                         Enable serial output and show port RX in graphic monitor"
     );
     println!("  -b, --baud <BAUD_RATE>                    Serial baud rate for output");
+    println!(
+        "      --log-file <PATH>                     Append per-frame HID/TX/RX logs to a file"
+    );
     println!("  -h, --help                                Show this help");
     println!();
     println!("Examples:");
     println!("  {bin_name} run");
     println!("  {bin_name} run --monitor raw");
     println!("  {bin_name} run --monitor compact");
+    println!("  {bin_name} run --log-file ds4.log");
     println!("  {bin_name} run --monitor none --format arm9 --port <PORT> --baud <BAUD_RATE>");
     println!("  {bin_name} run --monitor graphic --format arm9 --port <PORT> --baud <BAUD_RATE>");
 }
@@ -124,6 +128,7 @@ fn print_run_usage() {
     eprintln!("  ds4 run --monitor graphic");
     eprintln!("  ds4 run --monitor raw");
     eprintln!("  ds4 run --monitor compact");
+    eprintln!("  ds4 run --log-file ds4.log");
     eprintln!("  ds4 run --monitor none --format arm9 --port <PORT> --baud <BAUD_RATE>");
     eprintln!("  ds4 run --format arm9 --port <PORT> --baud <BAUD_RATE>");
 }

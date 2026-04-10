@@ -7,6 +7,8 @@
 - DS4 の入力状態をリアルタイムに表示
 - `graphic` / `raw` / `compact` / `none` の monitor モード
 - シリアルポートへの出力
+- `--port` 指定時のシリアル受信データ表示（バイト列と ASCII 文字列）
+- `--log-file` 指定時のフレーム単位ログ出力
 - `--monitor none` でのバックグラウンド実行
 - `status` / `stop` による実行状態の確認と停止
 - format を追加しやすい出力構成
@@ -219,10 +221,16 @@ ds4 run -m compact
 ds4 run -f arm9
 ```
 
-`arm9` 出力をシリアルポートへ送信する:
+`arm9` 出力をシリアルポートへ送信しつつ、graphic 下部に受信データも表示する:
 
 ```bash
 ds4 run -f arm9 -p /dev/ttyUSB0 -b 115200
+```
+
+HID と送受信データをログファイルへ追記する:
+
+```bash
+ds4 run -f arm9 -p /dev/ttyUSB0 -b 115200 --log-file logs/ds4.log
 ```
 
 モニタ表示なしでバックグラウンド実行する:
@@ -311,14 +319,12 @@ cargo test
 - `ds4 run -m none ...` はバックグラウンドで起動します
 - `ds4 status` で現在の実行状態を確認できます
 - `ds4 stop` で停止要求を送れます
-- フォアグラウンドの monitor は `Ctrl-C` で停止でき、終了時に画面をクリアします
+- フォアグラウンドの monitor は `Ctrl-C` で停止でき、終了時に元の端末画面へ戻ります
 
 ## ドキュメント
 
 追加の技術資料は `docs/` にまとめています。
 
-- [CONTROLLER_INPUT_TO_CAN_SUMMARY.md](docs/CONTROLLER_INPUT_TO_CAN_SUMMARY.md)
-- [MANUAL_MODE_CONTROLLER_TO_AC.md](docs/MANUAL_MODE_CONTROLLER_TO_AC.md)
-- [received_packet_can_mapping.md](docs/received_packet_can_mapping.md)
-- [DS4_USB_64BYTE_REPORT_LAYOUT.md](docs/DS4_USB_64BYTE_REPORT_LAYOUT.md)
-- [HID_TO_COMPACT_REQUIREMENTS.md](docs/HID_TO_COMPACT_REQUIREMENTS.md)
+- [DS4_HID_REPORT_SPEC.md](docs/DS4_HID_REPORT_SPEC.md)
+- [COMPACT_SPEC.md](docs/COMPACT_SPEC.md)
+- [ARM9_ACV6_PACKET_AND_CAN.md](docs/ARM9_ACV6_PACKET_AND_CAN.md)

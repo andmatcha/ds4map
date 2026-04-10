@@ -6,13 +6,27 @@ use std::io::{self, Stdin, Stdout, Write};
 use std::os::fd::AsRawFd;
 
 const RESET: &str = "\x1b[0m";
+const WHITE: &str = "\x1b[37m";
 const GREEN: &str = "\x1b[32m";
 const GRAY: &str = "\x1b[90m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
+const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
+const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
+const CLEAR_SCREEN: &str = "\x1b[2J";
+const HOME_CURSOR: &str = "\x1b[H";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
 
 const CANVAS_WIDTH: usize = 125;
 const CANVAS_HEIGHT: usize = 44;
+const FULL_MONITOR_CONTROLLER_WIDTH: usize = 116;
+const FULL_MONITOR_LOG_GAP: usize = 2;
+const FULL_MONITOR_MIN_LOG_WIDTH: usize = 6;
+const FULL_MONITOR_SHIFT_X: usize = 2;
+const HID_HISTORY_LIMIT: usize = 5;
+const TX_HISTORY_LIMIT: usize = 10;
+const RX_HISTORY_LIMIT: usize = 10;
 const LEFT_PAD_CENTER_X: usize = 22;
 const LEFT_STICK_CENTER_X: usize = 40;
 const CENTER_X: usize = 62;
@@ -77,15 +91,15 @@ impl DisplayMode {
     fn title(self) -> &'static str {
         match self {
             Self::Full => {
-                "DS4 Live Monitor                                          Ctrl-C to exit"
+                "DS4 Live Monitor                         Space pause  q quit  Ctrl-C exit"
             }
-            Self::Raw => "DS4 Raw HID Monitor                                       Ctrl-C to exit",
+            Self::Raw => {
+                "DS4 Raw HID Monitor                      Space pause  q quit  Ctrl-C exit"
+            }
             Self::Compact => {
-                "DS4 Compact Monitor                                       Ctrl-C to exit"
+                "DS4 Compact Monitor                  Space pause  q quit  Ctrl-C exit"
             }
-            Self::None => {
-                "DS4 Output                                                Ctrl-C to exit"
-            }
+            Self::None => "DS4 Output                            Space pause  q quit  Ctrl-C exit",
         }
     }
 }
@@ -104,6 +118,11 @@ pub struct MonitorFrame {
     pub output_format: Option<String>,
     pub output_state: Option<String>,
     pub output_bytes: Vec<u8>,
+    pub port_rx_state: Option<String>,
+    pub port_rx_bytes: Vec<u8>,
+    pub hid_history: Vec<Vec<u8>>,
+    pub tx_history: Vec<Vec<u8>>,
+    pub rx_history: Vec<String>,
 }
 
 impl MonitorFrame {
@@ -121,7 +140,27 @@ impl MonitorFrame {
             output_format: None,
             output_state: None,
             output_bytes: Vec::new(),
+            port_rx_state: None,
+            port_rx_bytes: Vec::new(),
+            hid_history: Vec::new(),
+            tx_history: Vec::new(),
+            rx_history: Vec::new(),
         }
+    }
+
+    pub fn push_hid_history(&mut self, bytes: Vec<u8>) {
+        self.hid_history.insert(0, bytes);
+        self.hid_history.truncate(HID_HISTORY_LIMIT);
+    }
+
+    pub fn push_tx_history(&mut self, bytes: Vec<u8>) {
+        self.tx_history.insert(0, bytes);
+        self.tx_history.truncate(TX_HISTORY_LIMIT);
+    }
+
+    pub fn push_rx_history(&mut self, text: String) {
+        self.rx_history.insert(0, text);
+        self.rx_history.truncate(RX_HISTORY_LIMIT);
     }
 }
 
@@ -132,12 +171,21 @@ pub struct MonitorUi {
     _terminal_input_guard: Option<TerminalInputGuard>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorAction {
+    TogglePause,
+    Quit,
+}
+
 impl MonitorUi {
     pub fn new(mode: DisplayMode) -> io::Result<Self> {
         let mut stdout = io::stdout();
         #[cfg(unix)]
         let terminal_input_guard = TerminalInputGuard::new()?;
-        write!(stdout, "\x1b[2J\x1b[H\x1b[?25l")?;
+        write!(
+            stdout,
+            "{ENTER_ALTERNATE_SCREEN}{CLEAR_SCREEN}{HOME_CURSOR}{HIDE_CURSOR}"
+        )?;
         stdout.flush()?;
         Ok(Self {
             mode,
@@ -149,47 +197,27 @@ impl MonitorUi {
 
     pub fn render(&mut self, frame: &MonitorFrame, status: Option<&str>) -> io::Result<()> {
         let mut screen = String::new();
+        let content_width = match self.mode {
+            DisplayMode::Full => terminal_size()
+                .map(|(width, _)| width)
+                .unwrap_or(CANVAS_WIDTH),
+            _ => CANVAS_WIDTH,
+        };
 
         writeln!(
             screen,
             "{}",
-            pad_visible_line(self.mode.title(), CANVAS_WIDTH)
+            pad_visible_line(self.mode.title(), content_width)
         )
         .expect("writing to String should not fail");
         writeln!(screen).expect("writing to String should not fail");
 
         match self.mode {
             DisplayMode::Full => {
-                render_full_monitor(&mut screen, frame);
-                write_common_monitor_lines(&mut screen, frame, status, self.mode);
-                write_wrapped_colored_line(
-                    &mut screen,
-                    "Compact: ",
-                    &format_report_hex(&frame.compact),
-                    GRAY,
-                );
-                write_wrapped_colored_line(
-                    &mut screen,
-                    "HID: ",
-                    &format_report_hex(&frame.raw_report),
-                    GRAY,
-                );
-                if let Some(format) = frame.output_format.as_deref() {
-                    write_colored_line(&mut screen, "Output:", GRAY);
-                    write_wrapped_colored_line(&mut screen, "  Format: ", format, GRAY);
-                    write_wrapped_colored_line(
-                        &mut screen,
-                        "  Status: ",
-                        frame.output_state.as_deref().unwrap_or("(none)"),
-                        GRAY,
-                    );
-                    write_wrapped_colored_line(
-                        &mut screen,
-                        "  Data: ",
-                        &format_report_hex(&frame.output_bytes),
-                        GRAY,
-                    );
-                }
+                let panel_width =
+                    full_monitor_panel_width(content_width).max(FULL_MONITOR_MIN_LOG_WIDTH);
+                write_full_monitor_header(&mut screen, frame, status, content_width);
+                render_full_monitor(&mut screen, frame, panel_width);
             }
             DisplayMode::Raw => {
                 write_common_monitor_lines(&mut screen, frame, status, self.mode);
@@ -202,9 +230,20 @@ impl MonitorUi {
             DisplayMode::None => {}
         }
 
-        let fitted_screen = fit_screen_to_terminal(&screen, CANVAS_WIDTH);
+        let fitted_screen = fit_screen_to_terminal(&screen, content_width);
         write!(self.stdout, "\x1b[H{fitted_screen}\x1b[J")?;
         self.stdout.flush()
+    }
+
+    pub fn poll_action(&mut self) -> io::Result<Option<MonitorAction>> {
+        #[cfg(unix)]
+        {
+            if let Some(guard) = self._terminal_input_guard.as_mut() {
+                return guard.poll_action();
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -243,6 +282,29 @@ impl TerminalInputGuard {
             original_termios,
         }))
     }
+
+    fn poll_action(&mut self) -> io::Result<Option<MonitorAction>> {
+        let fd = self.stdin.as_raw_fd();
+        let mut buffer = [0u8; 32];
+        let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+
+        let mut action = None;
+        for byte in &buffer[..count as usize] {
+            match monitor_action_from_byte(*byte) {
+                Some(MonitorAction::Quit) => return Ok(Some(MonitorAction::Quit)),
+                Some(MonitorAction::TogglePause) => action = Some(MonitorAction::TogglePause),
+                None => {}
+            }
+        }
+
+        Ok(action)
+    }
 }
 
 #[cfg(unix)]
@@ -260,17 +322,30 @@ impl Drop for TerminalInputGuard {
 
 #[cfg(unix)]
 fn disable_terminal_input_echo(termios: &mut libc::termios) {
-    termios.c_lflag &= !(libc::ECHO | libc::ECHONL);
+    termios.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON);
+    termios.c_cc[libc::VMIN] = 0;
+    termios.c_cc[libc::VTIME] = 0;
+}
+
+fn monitor_action_from_byte(byte: u8) -> Option<MonitorAction> {
+    match byte {
+        b' ' => Some(MonitorAction::TogglePause),
+        b'q' | b'Q' => Some(MonitorAction::Quit),
+        _ => None,
+    }
 }
 
 impl Drop for MonitorUi {
     fn drop(&mut self) {
-        let _ = write!(self.stdout, "\x1b[2J\x1b[H\x1b[0m\x1b[?25h");
+        let _ = write!(
+            self.stdout,
+            "{RESET}{SHOW_CURSOR}{LEAVE_ALTERNATE_SCREEN}{SHOW_CURSOR}"
+        );
         let _ = self.stdout.flush();
     }
 }
 
-fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
+fn render_full_monitor(screen: &mut String, frame: &MonitorFrame, panel_width: usize) {
     let view = CompactView::new(frame.compact);
     let touchpad_positions = if frame.transport == "usb" {
         usb_touch_positions(&frame.raw_report)
@@ -279,38 +354,43 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     };
     let battery_status = usb_battery_status(&frame.raw_report);
     let sensor_readings = usb_sensor_readings(&frame.raw_report);
-    let mut canvas = Canvas::new(CANVAS_WIDTH, CANVAS_HEIGHT);
+    let mut canvas = Canvas::new(FULL_MONITOR_CONTROLLER_WIDTH, CANVAS_HEIGHT);
+    let left_pad_center_x = LEFT_PAD_CENTER_X - FULL_MONITOR_SHIFT_X;
+    let left_stick_center_x = LEFT_STICK_CENTER_X - FULL_MONITOR_SHIFT_X;
+    let center_x = CENTER_X - FULL_MONITOR_SHIFT_X;
+    let right_stick_center_x = RIGHT_STICK_CENTER_X - FULL_MONITOR_SHIFT_X;
+    let right_face_center_x = RIGHT_FACE_CENTER_X - FULL_MONITOR_SHIFT_X;
 
-    draw_bitmap_trigger_button(&mut canvas, LEFT_PAD_CENTER_X, 0, "L2", view.l2_raw());
-    draw_bitmap_trigger_button(&mut canvas, RIGHT_FACE_CENTER_X, 0, "R2", view.r2_raw());
-    draw_bitmap_shoulder_button(&mut canvas, LEFT_PAD_CENTER_X, 6, "L1", view.l1_pressed());
-    draw_bitmap_shoulder_button(&mut canvas, RIGHT_FACE_CENTER_X, 6, "R1", view.r1_pressed());
-    draw_bitmap_battery(&mut canvas, CENTER_X, 0, battery_status);
+    draw_bitmap_trigger_button(&mut canvas, left_pad_center_x, 0, "L2", view.l2_raw());
+    draw_bitmap_trigger_button(&mut canvas, right_face_center_x, 0, "R2", view.r2_raw());
+    draw_bitmap_shoulder_button(&mut canvas, left_pad_center_x, 6, "L1", view.l1_pressed());
+    draw_bitmap_shoulder_button(&mut canvas, right_face_center_x, 6, "R1", view.r1_pressed());
+    draw_bitmap_battery(&mut canvas, center_x, 0, battery_status);
 
     draw_dot_pattern(
         &mut canvas,
-        LEFT_PAD_CENTER_X,
+        left_pad_center_x,
         13,
         dpad_up_bitmap(),
         view.up_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        LEFT_PAD_CENTER_X - 6,
+        left_pad_center_x.saturating_sub(6),
         16,
         dpad_left_bitmap(),
         view.left_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        LEFT_PAD_CENTER_X + 6,
+        left_pad_center_x + 6,
         16,
         dpad_right_bitmap(),
         view.right_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        LEFT_PAD_CENTER_X,
+        left_pad_center_x,
         19,
         dpad_down_bitmap(),
         view.down_pressed(),
@@ -318,28 +398,28 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
 
     draw_dot_pattern(
         &mut canvas,
-        RIGHT_FACE_CENTER_X,
+        right_face_center_x,
         12,
         triangle_bitmap(),
         view.triangle_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        RIGHT_FACE_CENTER_X - 9,
+        right_face_center_x - 9,
         16,
         square_bitmap(),
         view.square_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        RIGHT_FACE_CENTER_X + 9,
+        right_face_center_x + 9,
         16,
         circle_bitmap(),
         view.circle_pressed(),
     );
     draw_dot_pattern(
         &mut canvas,
-        RIGHT_FACE_CENTER_X,
+        right_face_center_x,
         20,
         cross_bitmap(),
         view.cross_pressed(),
@@ -347,7 +427,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
 
     draw_bitmap_touchpad(
         &mut canvas,
-        CENTER_X,
+        center_x,
         12,
         view.trackpad_pressed(),
         touchpad_positions,
@@ -356,14 +436,14 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     draw_bitmap_capsule_button(
         &mut canvas,
-        CENTER_X - 18,
+        center_x - 18,
         12,
         "SHARE",
         view.share_pressed(),
     );
     draw_bitmap_capsule_button(
         &mut canvas,
-        CENTER_X + 18,
+        center_x + 18,
         12,
         "OPTIONS",
         view.options_pressed(),
@@ -371,7 +451,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
 
     draw_bitmap_stick(
         &mut canvas,
-        LEFT_STICK_CENTER_X,
+        left_stick_center_x,
         30,
         view.lx_raw(),
         view.ly_raw(),
@@ -380,7 +460,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     draw_bitmap_stick(
         &mut canvas,
-        RIGHT_STICK_CENTER_X,
+        right_stick_center_x,
         30,
         view.rx_raw(),
         view.ry_raw(),
@@ -388,11 +468,11 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         StickSide::Right,
     );
 
-    draw_bitmap_circle_button(&mut canvas, CENTER_X, 29, "PS", view.ps_pressed());
+    draw_bitmap_circle_button(&mut canvas, center_x, 29, "PS", view.ps_pressed());
     let stick_char_width = STICK_PIXEL_DIAMETER.div_ceil(2);
     put_centered_in_box(
         &mut canvas,
-        LEFT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
+        left_stick_center_x.saturating_sub(stick_char_width / 2),
         stick_char_width,
         36,
         "Left Stick",
@@ -400,14 +480,14 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     put_centered_in_box(
         &mut canvas,
-        RIGHT_STICK_CENTER_X.saturating_sub(stick_char_width / 2),
+        right_stick_center_x.saturating_sub(stick_char_width / 2),
         stick_char_width,
         36,
         "Right Stick",
         Color::Gray,
     );
     canvas.put_centered(
-        LEFT_STICK_CENTER_X,
+        left_stick_center_x,
         37,
         &format!(
             "X:{:+4}% Y:{:+4}%",
@@ -417,7 +497,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
         Color::Gray,
     );
     canvas.put_centered(
-        RIGHT_STICK_CENTER_X,
+        right_stick_center_x,
         37,
         &format!(
             "X:{:+4}% Y:{:+4}%",
@@ -428,7 +508,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     draw_sensor_group(
         &mut canvas,
-        LEFT_STICK_CENTER_X.saturating_sub(SENSOR_ROW_WIDTH / 2),
+        left_stick_center_x.saturating_sub(SENSOR_ROW_WIDTH / 2),
         39,
         "GYRO",
         sensor_readings.map(|sensors| sensors.gyro),
@@ -437,7 +517,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     draw_sensor_group(
         &mut canvas,
-        RIGHT_STICK_CENTER_X.saturating_sub(SENSOR_ROW_WIDTH / 2),
+        right_stick_center_x.saturating_sub(SENSOR_ROW_WIDTH / 2),
         39,
         "ACCEL",
         sensor_readings.map(|sensors| sensors.accel),
@@ -446,7 +526,7 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
     );
     match sensor_readings {
         Some(sensors) => canvas.put_centered(
-            CENTER_X,
+            center_x,
             43,
             &format!(
                 "TS:{:05} TEMP:{:02}C",
@@ -454,10 +534,110 @@ fn render_full_monitor(screen: &mut String, frame: &MonitorFrame) {
             ),
             Color::Gray,
         ),
-        None => canvas.put_centered(CENTER_X, 43, "TS:N/A TEMP:N/A", Color::Gray),
+        None => canvas.put_centered(center_x, 43, "TS:N/A TEMP:N/A", Color::Gray),
     }
 
-    screen.push_str(&canvas.render());
+    let controller_lines = canvas
+        .render()
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let log_lines = build_full_monitor_log_lines(frame, panel_width);
+    let gap = " ".repeat(FULL_MONITOR_LOG_GAP);
+
+    for row in 0..controller_lines.len() {
+        let controller_line = controller_lines.get(row).map(String::as_str).unwrap_or("");
+        let log_line = log_lines.get(row).map(String::as_str).unwrap_or("");
+        writeln!(
+            screen,
+            "{controller_line}{gap}{}",
+            pad_visible_line(log_line, panel_width)
+        )
+        .expect("writing to String should not fail");
+    }
+}
+
+fn write_full_monitor_header(
+    screen: &mut String,
+    frame: &MonitorFrame,
+    status: Option<&str>,
+    content_width: usize,
+) {
+    write_colored_line_width(
+        screen,
+        &format!(
+            "Seq: {:>6}   Transport: {:<10}   Bytes: {:>3}   Status: {}",
+            frame.sequence,
+            frame.transport,
+            frame.report_len,
+            status.unwrap_or("receiving")
+        ),
+        GRAY,
+        content_width,
+    );
+    write_wrapped_colored_line_width(
+        screen,
+        "Device: ",
+        &format!(
+            "{}   VID:0x{:04X}   PID:0x{:04X}   IF:{}",
+            frame.device_name, frame.vendor_id, frame.product_id, frame.interface_number
+        ),
+        GRAY,
+        content_width,
+    );
+}
+
+fn build_full_monitor_log_lines(frame: &MonitorFrame, panel_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    push_full_monitor_log_section(
+        &mut lines,
+        "HID Recent",
+        &frame.hid_history,
+        panel_width,
+        |bytes| format_report_hex_wrapped_bytes(bytes, 32),
+    );
+    push_full_monitor_log_section(
+        &mut lines,
+        "TX Recent",
+        &frame.tx_history,
+        panel_width,
+        |bytes| format_report_hex(bytes),
+    );
+    push_full_monitor_log_section(
+        &mut lines,
+        "RX Text",
+        &frame.rx_history,
+        panel_width,
+        |text| text.clone(),
+    );
+    lines.truncate(CANVAS_HEIGHT);
+    lines
+}
+
+fn push_full_monitor_log_section<T, F>(
+    lines: &mut Vec<String>,
+    title: &str,
+    entries: &[T],
+    panel_width: usize,
+    format_entry: F,
+) where
+    F: Fn(&T) -> String,
+{
+    lines.push(format!("{GRAY}{title}{RESET}"));
+    if entries.is_empty() {
+        lines.push(format!("{GRAY}  (none){RESET}"));
+        lines.push(String::new());
+        return;
+    }
+
+    for (index, entry) in entries.iter().enumerate() {
+        let color = if index == 0 { WHITE } else { GRAY };
+        let wrapped_lines = wrap_plain_text(&format_entry(entry), panel_width.saturating_sub(2));
+        for wrapped_line in wrapped_lines {
+            lines.push(format!("{color}  {wrapped_line}{RESET}"));
+        }
+    }
+    lines.push(String::new());
 }
 
 fn render_raw_monitor(screen: &mut String, frame: &MonitorFrame) {
@@ -481,29 +661,21 @@ fn write_common_monitor_lines(
     status: Option<&str>,
     mode: DisplayMode,
 ) {
-    if mode == DisplayMode::Full {
-        write_colored_line(
-            screen,
-            &format!(
-                "Seq: {:>6}   Transport: {:<10}   Bytes: {:>3}",
-                frame.sequence, frame.transport, frame.report_len
-            ),
-            GRAY,
-        );
-    }
     match status {
         Some(message) => write_colored_line(screen, &format!("Status: {message}"), YELLOW),
         None => write_colored_line(screen, "Status: receiving", GRAY),
     }
-    write_wrapped_colored_line(
-        screen,
-        "Device: ",
-        &format!(
-            "{}   VID:0x{:04X}   PID:0x{:04X}   IF:{}",
-            frame.device_name, frame.vendor_id, frame.product_id, frame.interface_number
-        ),
-        GRAY,
-    );
+    if mode != DisplayMode::Full {
+        write_wrapped_colored_line(
+            screen,
+            "Device: ",
+            &format!(
+                "{}   VID:0x{:04X}   PID:0x{:04X}   IF:{}",
+                frame.device_name, frame.vendor_id, frame.product_id, frame.interface_number
+            ),
+            GRAY,
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1765,18 +1937,32 @@ fn pad_visible_line(text: &str, width: usize) -> String {
 }
 
 fn write_colored_line(screen: &mut String, text: &str, color: &str) {
-    let line = pad_visible_line(text, CANVAS_WIDTH);
+    write_colored_line_width(screen, text, color, CANVAS_WIDTH);
+}
+
+fn write_colored_line_width(screen: &mut String, text: &str, color: &str, width: usize) {
+    let line = pad_visible_line(text, width);
     writeln!(screen, "{color}{line}{RESET}").expect("writing to String should not fail");
 }
 
 fn write_wrapped_colored_line(screen: &mut String, prefix: &str, text: &str, color: &str) {
+    write_wrapped_colored_line_width(screen, prefix, text, color, CANVAS_WIDTH);
+}
+
+fn write_wrapped_colored_line_width(
+    screen: &mut String,
+    prefix: &str,
+    text: &str,
+    color: &str,
+    width: usize,
+) {
     let prefix_width = prefix.chars().count();
     let indent = " ".repeat(prefix_width);
     let mut current = prefix.to_owned();
     let mut current_width = prefix_width;
 
     if text.is_empty() {
-        write_colored_line(screen, prefix, color);
+        write_colored_line_width(screen, prefix, color, width);
         return;
     }
 
@@ -1784,8 +1970,8 @@ fn write_wrapped_colored_line(screen: &mut String, prefix: &str, text: &str, col
         let token_width = token.chars().count();
         let separator_width = usize::from(current_width > prefix_width);
 
-        if current_width + separator_width + token_width > CANVAS_WIDTH {
-            write_colored_line(screen, &current, color);
+        if current_width + separator_width + token_width > width {
+            write_colored_line_width(screen, &current, color, width);
             current = indent.clone();
             current_width = prefix_width;
         }
@@ -1799,7 +1985,7 @@ fn write_wrapped_colored_line(screen: &mut String, prefix: &str, text: &str, col
         current_width += token_width;
     }
 
-    write_colored_line(screen, &current, color);
+    write_colored_line_width(screen, &current, color, width);
 }
 
 fn format_report_hex(report: &[u8]) -> String {
@@ -1812,6 +1998,110 @@ fn format_report_hex(report: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn format_report_hex_wrapped_bytes(report: &[u8], bytes_per_line: usize) -> String {
+    if report.is_empty() {
+        return String::from("(none)");
+    }
+    if bytes_per_line == 0 {
+        return format_report_hex(report);
+    }
+
+    report
+        .chunks(bytes_per_line)
+        .map(format_report_hex)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+fn format_report_ascii(report: &[u8]) -> String {
+    if report.is_empty() {
+        return String::from("(none)");
+    }
+
+    let escaped = report
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect::<String>();
+    format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+fn format_report_hex_compact(report: &[u8], max_bytes: usize) -> String {
+    if report.is_empty() {
+        return String::from("(none)");
+    }
+
+    let shown = report
+        .iter()
+        .take(max_bytes)
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let remaining = report.len().saturating_sub(max_bytes);
+    if remaining == 0 {
+        shown
+    } else {
+        format!("{shown} ... (+{remaining}B)")
+    }
+}
+
+#[cfg(test)]
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_owned();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let truncated = text.chars().take(keep).collect::<String>();
+    format!("{truncated}...")
+}
+
+fn wrap_plain_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in text.chars() {
+        if ch == '\n' {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+            continue;
+        }
+
+        current.push(ch);
+        current_width += 1;
+        if current_width >= width {
+            lines.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+fn full_monitor_panel_width(content_width: usize) -> usize {
+    content_width.saturating_sub(FULL_MONITOR_CONTROLLER_WIDTH + FULL_MONITOR_LOG_GAP)
 }
 
 fn centered_left_padding(terminal_width: usize, content_width: usize) -> usize {
@@ -1947,11 +2237,13 @@ fn terminal_size_from_ioctl() -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, battery_fill_cell_grid,
-        battery_outline_cell_grid, centered_left_padding, fit_screen_to_terminal,
-        format_report_hex, pad_visible_line, signed_bar_fill_count, stick_char_marker_position,
-        stick_percent_x, stick_percent_y, touchpad_char_marker_position, trigger_percent,
-        truncate_ansi_line, usb_battery_status, usb_sensor_readings, usb_touch_positions,
+        BATTERY_CELL_HEIGHT, BATTERY_OUTLINE_CHAR_HEIGHT, MonitorAction, MonitorFrame,
+        battery_fill_cell_grid, battery_outline_cell_grid, centered_left_padding,
+        fit_screen_to_terminal, format_report_ascii, format_report_hex, format_report_hex_compact,
+        format_report_hex_wrapped_bytes, monitor_action_from_byte, pad_visible_line,
+        signed_bar_fill_count, stick_char_marker_position, stick_percent_x, stick_percent_y,
+        touchpad_char_marker_position, trigger_percent, truncate_ansi_line, truncate_chars,
+        usb_battery_status, usb_sensor_readings, usb_touch_positions, wrap_plain_text,
     };
     use std::env;
 
@@ -1988,6 +2280,81 @@ mod tests {
     #[test]
     fn format_report_hex_handles_empty_reports() {
         assert_eq!(format_report_hex(&[]), "(none)");
+    }
+
+    #[test]
+    fn format_report_hex_wrapped_bytes_breaks_at_32_bytes() {
+        let report = (0u8..34).collect::<Vec<_>>();
+        let formatted = format_report_hex_wrapped_bytes(&report, 32);
+        let lines = formatted.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].split(' ').count(), 32);
+        assert_eq!(lines[1], "20 21");
+    }
+
+    #[test]
+    fn format_report_ascii_handles_empty_reports() {
+        assert_eq!(format_report_ascii(&[]), "(none)");
+    }
+
+    #[test]
+    fn format_report_ascii_escapes_non_printable_bytes() {
+        assert_eq!(format_report_ascii(b"OK\r\n"), "\"OK\\r\\n\"");
+    }
+
+    #[test]
+    fn format_report_hex_compact_shows_remaining_byte_count() {
+        assert_eq!(
+            format_report_hex_compact(&[0x10, 0x20, 0x30, 0x40], 2),
+            "10 20 ... (+2B)"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_appends_ellipsis() {
+        assert_eq!(truncate_chars("abcdef", 5), "ab...");
+    }
+
+    #[test]
+    fn wrap_plain_text_splits_long_lines_without_ellipsis() {
+        assert_eq!(wrap_plain_text("abcdef", 3), vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn monitor_frame_hid_history_keeps_latest_five_entries() {
+        let mut frame = MonitorFrame::idle();
+        for index in 0..7 {
+            frame.push_hid_history(vec![index as u8]);
+        }
+
+        assert_eq!(frame.hid_history.len(), 5);
+        assert_eq!(frame.hid_history[0], vec![6]);
+        assert_eq!(frame.hid_history[4], vec![2]);
+    }
+
+    #[test]
+    fn monitor_frame_tx_history_keeps_latest_ten_entries() {
+        let mut frame = MonitorFrame::idle();
+        for index in 0..12 {
+            frame.push_tx_history(vec![index as u8]);
+        }
+
+        assert_eq!(frame.tx_history.len(), 10);
+        assert_eq!(frame.tx_history[0], vec![11]);
+        assert_eq!(frame.tx_history[9], vec![2]);
+    }
+
+    #[test]
+    fn monitor_frame_rx_history_keeps_latest_ten_entries() {
+        let mut frame = MonitorFrame::idle();
+        for index in 0..12 {
+            frame.push_rx_history(format!("rx-{index}"));
+        }
+
+        assert_eq!(frame.rx_history.len(), 10);
+        assert_eq!(frame.rx_history[0], "rx-11");
+        assert_eq!(frame.rx_history[9], "rx-2");
     }
 
     #[test]
@@ -2117,18 +2484,34 @@ mod tests {
     #[test]
     fn disable_terminal_input_echo_clears_echo_flags() {
         let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-        termios.c_lflag = libc::ECHO | libc::ECHONL | libc::ISIG;
+        termios.c_lflag = libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG;
+        termios.c_cc[libc::VMIN] = 1;
+        termios.c_cc[libc::VTIME] = 1;
 
         super::disable_terminal_input_echo(&mut termios);
 
         assert_eq!(termios.c_lflag & libc::ECHO, 0);
         assert_eq!(termios.c_lflag & libc::ECHONL, 0);
+        assert_eq!(termios.c_lflag & libc::ICANON, 0);
         assert_ne!(termios.c_lflag & libc::ISIG, 0);
+        assert_eq!(termios.c_cc[libc::VMIN], 0);
+        assert_eq!(termios.c_cc[libc::VTIME], 0);
     }
 
     #[test]
     fn touchpad_marker_position_stays_inside_bounds() {
         assert_eq!(touchpad_char_marker_position(0, 0, 27, 9), (0, 0));
         assert_eq!(touchpad_char_marker_position(1919, 942, 27, 9), (26, 7));
+    }
+
+    #[test]
+    fn monitor_action_from_byte_maps_pause_and_quit_keys() {
+        assert_eq!(
+            monitor_action_from_byte(b' '),
+            Some(MonitorAction::TogglePause)
+        );
+        assert_eq!(monitor_action_from_byte(b'q'), Some(MonitorAction::Quit));
+        assert_eq!(monitor_action_from_byte(b'Q'), Some(MonitorAction::Quit));
+        assert_eq!(monitor_action_from_byte(b'x'), None);
     }
 }

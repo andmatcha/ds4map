@@ -7,10 +7,16 @@ const TRIGGER_THRESHOLD: u8 = 205;
 const STICK_LOW_THRESHOLD: u8 = 25;
 const STICK_HIGH_THRESHOLD: u8 = 230;
 
+const CONTROL_BYTE_KBD_PP: u8 = 1 << 0;
+const CONTROL_BYTE_KBD_EN: u8 = 1 << 1;
+const CONTROL_BYTE_KBD_YAMAN: u8 = 1 << 2;
 const CONTROL_BYTE_NYOKKI_PUSH: u8 = 1 << 3;
 const CONTROL_BYTE_NYOKKI_PULL: u8 = 1 << 4;
-const CONTROL_BYTE_INITIALIZE: u8 = 1 << 5;
-const CONTROL_BYTE_HOME_POSE: u8 = 1 << 6;
+const CONTROL_BYTE_INIT: u8 = 1 << 5;
+const CONTROL_BYTE_HOME: u8 = 1 << 6;
+const CONTROL_BYTE_KBD_START: u8 = 1 << 7;
+const CONTROL_BYTE_MANUAL_UNUSED_BITS: u8 =
+    CONTROL_BYTE_KBD_PP | CONTROL_BYTE_KBD_EN | CONTROL_BYTE_KBD_YAMAN | CONTROL_BYTE_KBD_START;
 
 const DEFAULT_HEADER: [u8; 2] = *b"AC";
 const DEFAULT_NEUTRAL_CURRENT: u16 = 255;
@@ -258,8 +264,8 @@ impl ManualProfile {
 }
 
 fn build_manual_control_byte(
-    initialize_pressed: bool,
-    home_pose_pressed: bool,
+    init_pressed: bool,
+    home_pressed: bool,
     nyokki_push_pressed: bool,
     nyokki_pull_pressed: bool,
 ) -> u8 {
@@ -271,12 +277,14 @@ fn build_manual_control_byte(
     if nyokki_pull_pressed {
         control_byte |= CONTROL_BYTE_NYOKKI_PULL;
     }
-    if initialize_pressed {
-        control_byte |= CONTROL_BYTE_INITIALIZE;
+    if init_pressed {
+        control_byte |= CONTROL_BYTE_INIT;
     }
-    if home_pose_pressed {
-        control_byte |= CONTROL_BYTE_HOME_POSE;
+    if home_pressed {
+        control_byte |= CONTROL_BYTE_HOME;
     }
+
+    debug_assert_eq!(control_byte & CONTROL_BYTE_MANUAL_UNUSED_BITS, 0);
 
     control_byte
 }
@@ -539,12 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn control_byte_uses_r3_l3_and_dpad_up_down() {
+    fn control_byte_uses_latest_manual_bits() {
         let mut encoder = ManualPacketEncoder::new();
         let packet =
             encoder.encode_compact_report(&[1 << 0, (1 << 4) | (1 << 5), 0, 128, 0, 128, 0, 0]);
 
         assert_eq!(packet[30], (1 << 3) | (1 << 5) | (1 << 6));
+        assert_eq!(packet[30] & ((1 << 0) | (1 << 1) | (1 << 2) | (1 << 7)), 0);
 
         let down = encoder.encode_compact_report(&[1 << 2, 0, 0, 128, 0, 128, 0, 0]);
 
