@@ -1,4 +1,5 @@
 use serialport::{ClearBuffer, Error as SerialError, SerialPort, new};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +54,7 @@ impl PortRxSnapshot {
 pub struct SerialOutput {
     port: Box<dyn SerialPort>,
     port_rx: Arc<Mutex<PortRxSnapshot>>,
+    port_rx_chunks: Arc<Mutex<VecDeque<Vec<u8>>>>,
     reader_stop_requested: Arc<AtomicBool>,
     reader_thread: Option<JoinHandle<()>>,
 }
@@ -73,10 +75,12 @@ impl SerialOutput {
             .set_timeout(Duration::from_millis(READ_TIMEOUT_MILLIS))
             .map_err(SerialOutputError::Configure)?;
         let port_rx = Arc::new(Mutex::new(PortRxSnapshot::waiting()));
+        let port_rx_chunks = Arc::new(Mutex::new(VecDeque::new()));
         let reader_stop_requested = Arc::new(AtomicBool::new(false));
         let reader_thread = Some(spawn_reader_thread(
             reader,
             Arc::clone(&port_rx),
+            Arc::clone(&port_rx_chunks),
             Arc::clone(&reader_stop_requested),
             port_rx_callback,
         ));
@@ -84,6 +88,7 @@ impl SerialOutput {
         Ok(Self {
             port,
             port_rx,
+            port_rx_chunks,
             reader_stop_requested,
             reader_thread,
         })
@@ -99,6 +104,10 @@ impl SerialOutput {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
+
+    pub fn take_port_rx_chunks(&self) -> Vec<Vec<u8>> {
+        drain_port_rx_chunks(&self.port_rx_chunks)
+    }
 }
 
 impl Drop for SerialOutput {
@@ -113,6 +122,7 @@ impl Drop for SerialOutput {
 fn spawn_reader_thread(
     mut reader: Box<dyn SerialPort>,
     port_rx: Arc<Mutex<PortRxSnapshot>>,
+    port_rx_chunks: Arc<Mutex<VecDeque<Vec<u8>>>>,
     stop_requested: Arc<AtomicBool>,
     port_rx_callback: Option<PortRxCallback>,
 ) -> JoinHandle<()> {
@@ -141,6 +151,7 @@ fn spawn_reader_thread(
                         String::from("received"),
                         received.clone(),
                     );
+                    push_port_rx_chunk(&port_rx_chunks, received.clone());
                     update_port_rx_status(&port_rx, String::from("received"), Some(received));
                 }
                 Err(error) if is_transient_read_error(&error) => {}
@@ -153,6 +164,20 @@ fn spawn_reader_thread(
             }
         }
     })
+}
+
+fn push_port_rx_chunk(port_rx_chunks: &Arc<Mutex<VecDeque<Vec<u8>>>>, bytes: Vec<u8>) {
+    port_rx_chunks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push_back(bytes);
+}
+
+fn drain_port_rx_chunks(port_rx_chunks: &Arc<Mutex<VecDeque<Vec<u8>>>>) -> Vec<Vec<u8>> {
+    let mut queue = port_rx_chunks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    queue.drain(..).collect()
 }
 
 fn notify_port_rx_callback(callback: Option<&PortRxCallback>, status: String, bytes: Vec<u8>) {
@@ -201,4 +226,22 @@ fn is_transient_read_error(error: &io::Error) -> bool {
         error.kind(),
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_port_rx_chunks, push_port_rx_chunk};
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn port_rx_chunks_are_drained_in_fifo_order() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        push_port_rx_chunk(&queue, b"first".to_vec());
+        push_port_rx_chunk(&queue, b"second".to_vec());
+
+        let drained = drain_port_rx_chunks(&queue);
+        assert_eq!(drained, vec![b"first".to_vec(), b"second".to_vec()]);
+        assert!(drain_port_rx_chunks(&queue).is_empty());
+    }
 }

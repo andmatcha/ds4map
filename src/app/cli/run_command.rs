@@ -107,19 +107,25 @@ impl RunOutput {
         Ok(ProcessedOutput { bytes, status })
     }
 
-    fn sync_port_rx_into_frame(&self, frame: &mut MonitorFrame) -> bool {
+    fn sync_port_rx_into_frame(
+        &self,
+        frame: &mut MonitorFrame,
+        rx_text_pending: &mut String,
+    ) -> bool {
         let Some(serial) = self.serial.as_ref() else {
             return false;
         };
 
+        let received_chunks = serial.take_port_rx_chunks();
         let snapshot = serial.port_rx_snapshot();
-        let changed = frame.port_rx_state.as_deref() != Some(snapshot.status.as_str())
+        let mut changed = !received_chunks.is_empty()
+            || frame.port_rx_state.as_deref() != Some(snapshot.status.as_str())
             || frame.port_rx_bytes != snapshot.bytes;
-        if snapshot.status == "received"
-            && frame.port_rx_bytes != snapshot.bytes
-            && !snapshot.bytes.is_empty()
-        {
-            frame.push_rx_history(format_report_ascii_text(&snapshot.bytes));
+        for chunk in received_chunks {
+            for line in consume_received_text(&chunk, rx_text_pending) {
+                frame.push_rx_history(line);
+                changed = true;
+            }
         }
         frame.port_rx_state = Some(snapshot.status);
         frame.port_rx_bytes = snapshot.bytes;
@@ -133,6 +139,7 @@ struct LiveMonitorSession {
     output: Option<RunOutput>,
     logger: Option<Arc<RunLogger>>,
     paused: bool,
+    rx_text_pending: String,
     render_error: Option<String>,
     effective_output_format: Option<OutputFormat>,
     serial_enabled: bool,
@@ -188,7 +195,7 @@ impl LiveMonitorSession {
         };
 
         if let Some(output) = self.output.as_ref() {
-            output.sync_port_rx_into_frame(&mut self.last_frame);
+            output.sync_port_rx_into_frame(&mut self.last_frame, &mut self.rx_text_pending);
         }
 
         if self.paused {
@@ -206,10 +213,9 @@ impl LiveMonitorSession {
             return;
         }
 
-        let should_render = self
-            .output
-            .as_ref()
-            .is_some_and(|output| output.sync_port_rx_into_frame(&mut self.last_frame));
+        let should_render = self.output.as_ref().is_some_and(|output| {
+            output.sync_port_rx_into_frame(&mut self.last_frame, &mut self.rx_text_pending)
+        });
 
         if self.paused {
             return;
@@ -337,6 +343,7 @@ pub(crate) fn run_live_monitor(args: Vec<String>, bin_name: &str) -> ExitCode {
             output,
             logger,
             paused: false,
+            rx_text_pending: String::new(),
             render_error: None,
             effective_output_format: config.effective_output_format(),
             serial_enabled: config.serial.is_some(),
@@ -459,12 +466,8 @@ fn monitor_frame_from_event(
     }
 }
 
-fn format_report_ascii_text(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::from("(none)");
-    }
-
-    let normalized = String::from_utf8_lossy(bytes)
+fn normalize_received_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
         .chars()
         .filter_map(|ch| match ch {
             '\r' => None,
@@ -472,14 +475,26 @@ fn format_report_ascii_text(bytes: &[u8]) -> String {
             _ if ch.is_control() => Some(' '),
             _ => Some(ch),
         })
-        .collect::<String>();
+        .collect()
+}
 
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        String::from("(empty)")
-    } else {
-        trimmed.to_owned()
+fn consume_received_text(bytes: &[u8], pending: &mut String) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for ch in normalize_received_text(bytes).chars() {
+        if ch == '\n' {
+            let trimmed = pending.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_owned());
+            }
+            pending.clear();
+            continue;
+        }
+
+        pending.push(ch);
     }
+
+    lines
 }
 
 fn parse_run_args(args: Vec<String>) -> Result<RunCommandConfig, String> {
@@ -569,7 +584,7 @@ fn logger_port_rx_callback(logger: Option<&Arc<RunLogger>>) -> Option<PortRxCall
 
 #[cfg(test)]
 mod tests {
-    use super::{format_report_ascii_text, parse_run_args};
+    use super::{consume_received_text, normalize_received_text, parse_run_args};
     use crate::output::OutputFormat;
     use crate::ui::live_monitor::DisplayMode;
 
@@ -683,12 +698,31 @@ mod tests {
     }
 
     #[test]
-    fn format_report_ascii_text_renders_plain_text() {
-        assert_eq!(format_report_ascii_text(b"OK\r\nREADY"), "OK\nREADY");
+    fn normalize_received_text_renders_plain_text() {
+        assert_eq!(normalize_received_text(b"OK\r\nREADY"), "OK\nREADY");
     }
 
     #[test]
-    fn format_report_ascii_text_replaces_non_text_control_chars() {
-        assert_eq!(format_report_ascii_text(b"A\x01B"), "A B");
+    fn normalize_received_text_replaces_non_text_control_chars() {
+        assert_eq!(normalize_received_text(b"A\x01B"), "A B");
+    }
+
+    #[test]
+    fn consume_received_text_keeps_partial_line_until_next_chunk() {
+        let mut pending = String::new();
+        assert!(consume_received_text(b"RE", &mut pending).is_empty());
+        assert_eq!(pending, "RE");
+
+        let lines = consume_received_text(b"ADY\nOK\n", &mut pending);
+        assert_eq!(lines, vec![String::from("READY"), String::from("OK")]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn consume_received_text_skips_empty_lines() {
+        let mut pending = String::new();
+        let lines = consume_received_text(b"\nA\n\n", &mut pending);
+        assert_eq!(lines, vec![String::from("A")]);
+        assert!(pending.is_empty());
     }
 }
