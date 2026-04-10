@@ -11,6 +11,12 @@ const GREEN: &str = "\x1b[32m";
 const GRAY: &str = "\x1b[90m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";
+const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
+const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
+const CLEAR_SCREEN: &str = "\x1b[2J";
+const HOME_CURSOR: &str = "\x1b[H";
+const HIDE_CURSOR: &str = "\x1b[?25l";
+const SHOW_CURSOR: &str = "\x1b[?25h";
 
 const CANVAS_WIDTH: usize = 125;
 const CANVAS_HEIGHT: usize = 44;
@@ -176,7 +182,10 @@ impl MonitorUi {
         let mut stdout = io::stdout();
         #[cfg(unix)]
         let terminal_input_guard = TerminalInputGuard::new()?;
-        write!(stdout, "\x1b[2J\x1b[H\x1b[?25l")?;
+        write!(
+            stdout,
+            "{ENTER_ALTERNATE_SCREEN}{CLEAR_SCREEN}{HOME_CURSOR}{HIDE_CURSOR}"
+        )?;
         stdout.flush()?;
         Ok(Self {
             mode,
@@ -328,7 +337,10 @@ fn monitor_action_from_byte(byte: u8) -> Option<MonitorAction> {
 
 impl Drop for MonitorUi {
     fn drop(&mut self) {
-        let _ = write!(self.stdout, "\x1b[2J\x1b[H\x1b[0m\x1b[?25h");
+        let _ = write!(
+            self.stdout,
+            "{RESET}{SHOW_CURSOR}{LEAVE_ALTERNATE_SCREEN}{SHOW_CURSOR}"
+        );
         let _ = self.stdout.flush();
     }
 }
