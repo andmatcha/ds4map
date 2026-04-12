@@ -1,6 +1,6 @@
 # ds4map
 
-`ds4map` は、DUALSHOCK 4 の入力レポートを読み取り、内部の compact 形式へ変換し、CLI 上でリアルタイム表示しつつ、必要に応じて `arm9` などの format 向け出力データを生成・送信できる Rust 製のアプリケーションです。
+`ds4map` は、DUALSHOCK 4 の入力レポートを読み取り、CLI 上でリアルタイム表示しつつ、必要に応じて `arm9` などの format 向け出力データを生成・送信できる Rust 製のアプリケーションです。
 
 ## 主な機能
 
@@ -11,42 +11,48 @@
 - `--log-file` 指定時のフレーム単位ログ出力
 - `--monitor none` でのバックグラウンド実行
 - `status` / `stop` による実行状態の確認と停止
-- format を追加しやすい出力構成
 
 ## 動作に必要なもの
 
-- Rust ツールチェーン
+- `make`
+- Rust ツールチェーン（`make init` で自動インストール可能）
 - 接続された DUALSHOCK 4
 - macOS では、`arm9` 用のモード切り替え音再生に `afplay` を利用可能な場合があります
 
 ## セットアップ
 
-このプロジェクトは、仲間内で使う前提であれば、リポジトリを `git clone` してローカルでビルドする運用がいちばん簡単です。
+このプロジェクトは、リポジトリを `git clone` してローカルでビルドする運用がいちばん簡単です。
 
 ### 1. リポジトリを clone する
 
 ```bash
-git clone <YOUR_GIT_URL>
+git clone <REPO_URL>
 cd ds4map
 ```
 
-### 2. Rust をインストールする
+### 2. 初期化する
 
-まだ `cargo` が使えない場合は、次でインストールできます。
-
-```bash
-curl https://sh.rustup.rs -sSf | sh
-```
-
-インストール後は、案内に従ってシェルを再起動するか、環境変数を反映してください。
-
-### 3. ビルドする
+リポジトリのルートで次を実行してください。
 
 ```bash
-cargo build
+make init
 ```
 
-### 4. 実行する
+`make init` は次をまとめて実行します。
+
+- `cargo` が見つからない場合は `rustup` で Rust をインストール
+- `Cargo.lock` に従って依存関係を取得
+- ローカルビルド
+
+すでに構築済みの環境でも、同じコマンドを再実行して構いません。
+
+### 3. 実行する
+
+```bash
+./target/debug/ds4 run
+```
+
+Cargo 経由でも実行できます。
 
 ```bash
 cargo run -- run
@@ -58,40 +64,23 @@ cargo run -- run
 ./target/debug/ds4 run
 ```
 
-### 5. `ds4` コマンドとして使いたい場合
+### 4. ソースコードを変更したあとにリポジトリ内のバイナリを更新する
 
-clone したリポジトリからそのままインストールできます。
-
-```bash
-cargo install --path . --bin ds4
-```
-
-以後は次のように実行できます。
+リポジトリ内のバイナリを使う場合は、次を実行してください。
 
 ```bash
-ds4 run
+make build
 ```
 
-グローバルに入れたくない場合は、そのまま `cargo run -- run` を使ってください。
+### 5. `ds4` コマンドをグローバルインストールする
 
-### 6. ソースコードを変更したあとに `ds4` コマンドへ反映する
-
-`cargo install --path . --bin ds4` で入る `ds4` コマンドは、その時点のソースからビルドされたものです。  
-そのため、ソースコードを書き換えたあとは再インストールが必要です。
-
-反映するときは、リポジトリのルートで次を実行してください。
+グローバルに `ds4` コマンドとして入れたい場合だけ、次を実行してください。
 
 ```bash
-cargo install --path . --bin ds4 --force
+make install-global
 ```
 
-これで、現在のソースコードから `ds4` コマンドを上書きインストールできます。
-
-もしコマンドとして入れ直したくない場合は、再ビルドしたうえで毎回こちらを使っても構いません。
-
-```bash
-cargo run -- run
-```
+ソースコード変更後にグローバルの `ds4` コマンドへ反映したいときも、同じ `make install-global` を使えます。
 
 ## ビルド
 
@@ -116,10 +105,10 @@ cargo run -- run
 まずは help が出ることを確認してください。
 
 ```bash
-ds4 --help
+./target/debug/ds4 --help
 ```
 
-まだ `cargo install --path . --bin ds4` をしていない場合は、こちらでも確認できます。
+まだ `make init` をしていない場合は、こちらでも確認できます。
 
 ```bash
 cargo run -- --help
@@ -128,18 +117,20 @@ cargo run -- --help
 最初によく使うコマンド:
 
 ```bash
-ds4 devices
-ds4 ports
-ds4 run
+./target/debug/ds4 devices
+./target/debug/ds4 ports
+./target/debug/ds4 run
 ```
 
-ソース変更後に `ds4` コマンドへ反映したいとき:
+グローバルの `ds4` コマンドを入れたいとき:
 
 ```bash
-cargo install --path . --bin ds4 --force
+make install-global
 ```
 
 ## コマンド一覧
+
+以下は `./target/debug/ds4` を使うか、`make install-global` 後は `ds4` に読み替えてください。
 
 ### 接続中の DS4 を表示
 
